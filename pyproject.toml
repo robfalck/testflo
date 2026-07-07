@@ -80,7 +80,7 @@ mpi4py  = "*"
 testflo = { path = ".", editable = true }
 
 [tool.pixi.tasks]
-test = "testflo testflo/tests/"
+test = "testflo --skip_dir=pytest_tests testflo/tests/"
 
 # ---------------------------------------------------------------------------
 # pytest feature — extends the default environment with pytest tooling
@@ -91,7 +91,7 @@ pytest       = ">=7.0"
 pytest-xdist = "*"
 
 [tool.pixi.feature.pytest.tasks]
-test_pytest_plugin = "pytest testflo/tests/test_pytest_plugin.py"
+test_pytest_plugin = "pytest testflo/tests/pytest_tests/test_pytest_plugin.py"
 
 # ---------------------------------------------------------------------------
 # environments

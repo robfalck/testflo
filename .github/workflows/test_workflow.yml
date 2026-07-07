@@ -77,7 +77,7 @@ jobs:
         run: |
           cd $HOME
 
-          testflo testflo.tests -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
+          testflo --skip_dir=pytest_tests testflo.tests -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
 
           if [[ $RC -ne 1 ]]; then
             echo "Expected some tests to fail."
@@ -111,7 +111,7 @@ jobs:
         run: |
           cd $HOME
 
-          testflo testflo.tests -n 1 -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
+          testflo --skip_dir=pytest_tests testflo.tests -n 1 -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
 
           if [[ $RC -ne 1 ]]; then
             echo "Expected some tests to fail."
@@ -147,9 +147,9 @@ jobs:
 
           python -m pip install pytest pytest-cov pytest-xdist
 
-          pytest testflo/tests/test_pytest_plugin.py -n auto
-          pytest testflo/tests/test_pytest_plugin.py -n auto --mpi-workers=2
-          pytest testflo/tests/test_pytest_plugin.py -n auto --nompi
+          pytest testflo/tests/pytest_tests/test_pytest_plugin.py -n auto
+          pytest testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --mpi-workers=2
+          pytest testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --nompi
 
       - name: Notify slack of failure
         uses: act10ns/slack@v2.0.0
