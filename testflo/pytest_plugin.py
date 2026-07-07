@@ -41,6 +41,7 @@ import sys
 import json
 import time
 import shutil
+import numbers
 import subprocess
 import functools
 import collections.abc
@@ -224,12 +225,23 @@ def pytest_configure(config):
         os.environ["TESTFLO_PYTEST_MPIRUN"] = config.getoption("--mpirun-exe")
         _find_mpirun.cache_clear()
 
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_cmdline_main(config):
+    """Force --dist loadgroup when xdist is active and the user did not
+    explicitly set --dist.
+
+    Uses tryfirst+hookwrapper so we set config.option.dist *before* xdist's
+    own tryfirst pytest_cmdline_main body runs and creates the scheduler.
+    xdist's cmdline_main would otherwise reset 'no' → 'load' when -n is
+    given; by setting it here first, xdist sees 'loadgroup' and creates a
+    LoadGroupScheduling session instead.
+    """
     if config.pluginmanager.hasplugin("xdist") and not _is_child():
-        # Force --dist loadgroup unless the user explicitly chose a dist mode.
-        # xdist's ini default for 'dist' is 'no'; treat that as "not set".
-        dist_value = config.getoption("--dist", default="no")
-        if dist_value == "no":
+        dist_cli = config.getoption("--dist", default="no")
+        if dist_cli == "no":
             config.option.dist = "loadgroup"
+    outcome = yield
+    return outcome
 
 
 def pytest_sessionstart(session):
@@ -322,9 +334,8 @@ _NPROCS_KEY = pytest.StashKey()
 # ---------------------------------------------------------------------------
 
 class FakeComm(object):
-    """
-    Stand-in for an MPI communicator when running without MPI.
-    """
+    """Stand-in for an MPI communicator when running without MPI
+    (serial tests, or parallel tests under ``--nompi``)."""
 
     rank = 0
     size = 1
@@ -370,10 +381,8 @@ def comm(request):
 
 @pytest.fixture(autouse=True)
 def _mpi_barrier_finalize(request):
-    """Barrier at the end of each test when running under MPI.
-
-    Used to localize tests that are not fully collective.
-    """
+    """Barrier at the end of each test when running under MPI, to localize
+    tests that are not fully collective (same idea as mpi-pytest)."""
     if _is_child() or _outer_world_size() > 1:
         from mpi4py import MPI
         request.addfinalizer(MPI.COMM_WORLD.barrier)
@@ -387,10 +396,8 @@ _child_results = {}
 
 
 def _record_child_report(report):
-    """Keep the 'worst' report per nodeid.
-
-    A failed setup/call/teardow beats a pass; a call report beats setup/teardown noise.
-    """
+    """Keep the 'worst' report per nodeid: a failed setup/call/teardown
+    beats a pass; a call report beats setup/teardown noise."""
     nodeid = report.nodeid
     entry = {
         "when": report.when,
