@@ -25,8 +25,33 @@ dependencies = [
     "coverage>=6.0",
 ]
 
+# The MPI pytest plugin (testflo.pytest_plugin) needs pytest, but the
+# testflo *runner* does not -- keep pytest optional so `pip install testflo`
+# stays lightweight. Install `testflo[pytest]` to use the plugin, or just
+# have pytest present in the environment (the plugin's pytest11 entry point
+# only activates under pytest anyway).
+[project.optional-dependencies]
+pytest = [
+    "pytest>=7.0",
+]
+mpi = [
+    "mpi4py",
+]
+test = [
+    "pytest>=7.0",
+    "mpi4py",
+    "pytest-xdist",
+]
+
 [project.scripts]
 testflo = "testflo.main:main"
+
+# pytest plugin providing testflo-style MPI execution (spawned mpirun per
+# @pytest.mark.parallel / N_PROCS test). Loaded only when pytest runs, so
+# testflo itself takes no dependency on pytest. Disable per-run with
+# `pytest -p no:testflo`.
+[project.entry-points.pytest11]
+testflo = "testflo.pytest_plugin"
 
 [tool.hatch.version]
 path = "testflo/__init__.py"
@@ -35,3 +60,43 @@ path = "testflo/__init__.py"
 include = [
     "/testflo",
 ]
+
+# ---------------------------------------------------------------------------
+# pixi workspace
+# ---------------------------------------------------------------------------
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+exclude-newer = "7d"
+
+[tool.pixi.dependencies]
+python  = ">=3.11"
+pip     = "*"
+openmpi = "*"
+mpi4py  = "*"
+
+[tool.pixi.pypi-dependencies]
+testflo = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+test = "testflo testflo/tests/"
+
+# ---------------------------------------------------------------------------
+# pytest feature — extends the default environment with pytest tooling
+# ---------------------------------------------------------------------------
+
+[tool.pixi.feature.pytest.pypi-dependencies]
+pytest       = ">=7.0"
+pytest-xdist = "*"
+
+[tool.pixi.feature.pytest.tasks]
+test_pytest_plugin = "pytest testflo/tests/test_pytest_plugin.py"
+
+# ---------------------------------------------------------------------------
+# environments
+# ---------------------------------------------------------------------------
+
+[tool.pixi.environments]
+default = { features = [],         solve-group = "default" }
+pytest  = { features = ["pytest"], solve-group = "default" }
