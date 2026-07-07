@@ -41,7 +41,6 @@ import sys
 import json
 import time
 import shutil
-import numbers
 import subprocess
 import functools
 import collections.abc
@@ -323,8 +322,9 @@ _NPROCS_KEY = pytest.StashKey()
 # ---------------------------------------------------------------------------
 
 class FakeComm(object):
-    """Stand-in for an MPI communicator when running without MPI
-    (serial tests, or parallel tests under ``--nompi``)."""
+    """
+    Stand-in for an MPI communicator when running without MPI.
+    """
 
     rank = 0
     size = 1
@@ -370,8 +370,10 @@ def comm(request):
 
 @pytest.fixture(autouse=True)
 def _mpi_barrier_finalize(request):
-    """Barrier at the end of each test when running under MPI, to localize
-    tests that are not fully collective (same idea as mpi-pytest)."""
+    """Barrier at the end of each test when running under MPI.
+
+    Used to localize tests that are not fully collective.
+    """
     if _is_child() or _outer_world_size() > 1:
         from mpi4py import MPI
         request.addfinalizer(MPI.COMM_WORLD.barrier)
@@ -385,8 +387,10 @@ _child_results = {}
 
 
 def _record_child_report(report):
-    """Keep the 'worst' report per nodeid: a failed setup/call/teardown
-    beats a pass; a call report beats setup/teardown noise."""
+    """Keep the 'worst' report per nodeid.
+
+    A failed setup/call/teardow beats a pass; a call report beats setup/teardown noise.
+    """
     nodeid = report.nodeid
     entry = {
         "when": report.when,
