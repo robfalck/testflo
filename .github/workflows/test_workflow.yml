@@ -147,9 +147,9 @@ jobs:
 
           python -m pip install pytest pytest-cov pytest-xdist
 
-          pytest testflo/tests/pytest_tests/test_pytest_plugin.py -n auto
-          pytest testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --mpi-workers=2
-          pytest testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --nompi
+          pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto
+          pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --mpi-workers=2
+          pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --nompi
 
       - name: Notify slack of failure
         uses: act10ns/slack@v2.0.0
