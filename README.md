@@ -270,6 +270,14 @@ without MPI installed:
 pytest --nompi
 ```
 
+### Known issues
+
+**MPICH on macOS**: A networking issue exists when using MPICH with OFI (OpenFabrics Interface) on macOS
+in edge cases where MPI processes are forcefully terminated (e.g., `SIGKILL` from a timeout).
+This manifests as an error during MPI finalization: `OFI poll failed (default nic=...: Input/output error)`.
+This is not encountered in normal usage but may appear in stress tests or timeout scenarios.
+If encountered, switch to OpenMPI as a workaround.
+
 ### Options summary
 
 | Option | Description |

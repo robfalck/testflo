@@ -4,7 +4,9 @@ These use pytest's ``pytester`` fixture to run the plugin end-to-end,
 including real mpirun spawning where MPI is available.
 """
 
+import platform
 import shutil
+import subprocess
 
 import pytest
 
@@ -17,6 +19,23 @@ except ImportError:
     HAVE_MPI = False
 
 mpi = pytest.mark.skipif(not HAVE_MPI, reason="requires mpi4py and mpirun")
+
+
+def _is_mpich_on_macos():
+    """Check if running MPICH on macOS."""
+    if platform.system() != "Darwin":
+        return False
+    try:
+        output = subprocess.check_output(["mpirun", "--version"], stderr=subprocess.STDOUT, text=True)
+        return "HYDRA" in output
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+skip_mpich_macos = pytest.mark.skipif(
+    _is_mpich_on_macos(),
+    reason="MPICH on macOS has OFI finalization issues with forced process termination"
+)
 
 
 @mpi
@@ -142,6 +161,7 @@ def test_captured_output_labeled_by_rank(pytester):
 
 
 @mpi
+@skip_mpich_macos
 def test_mpi_timeout_breaks_deadlock(pytester):
     """A desynchronized collective (the known caveat of the natural-assert
     model) is broken by --mpi-timeout instead of hanging forever."""

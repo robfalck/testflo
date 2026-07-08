@@ -73,14 +73,24 @@ exclude-newer = "7d"
 [tool.pixi.dependencies]
 python  = ">=3.11"
 pip     = "*"
-openmpi = "*"
-mpi4py  = "*"
 
 [tool.pixi.pypi-dependencies]
 testflo = { path = ".", editable = true }
 
 [tool.pixi.tasks]
 test = "testflo --skip_dir=pytest_tests testflo/tests/"
+
+# ---------------------------------------------------------------------------
+# MPI implementations
+# ---------------------------------------------------------------------------
+
+[tool.pixi.feature.openmpi.dependencies]
+openmpi = "*"
+mpi4py  = "*"
+
+[tool.pixi.feature.mpich.dependencies]
+mpich = "*"
+mpi4py  = "*"
 
 # ---------------------------------------------------------------------------
 # pytest feature — extends the default environment with pytest tooling
@@ -98,5 +108,7 @@ test_pytest_plugin = "pytest testflo/tests/pytest_tests/test_pytest_plugin.py"
 # ---------------------------------------------------------------------------
 
 [tool.pixi.environments]
-default = { features = [],         solve-group = "default" }
-pytest  = { features = ["pytest"], solve-group = "default" }
+default      = { features = ["openmpi"],           solve-group = "openmpi" }
+mpich        = { features = ["mpich"],            solve-group = "mpich" }
+pytest       = { features = ["openmpi", "pytest"], solve-group = "openmpi" }
+pytest-mpich = { features = ["mpich", "pytest"],  solve-group = "mpich" }
