@@ -485,7 +485,12 @@ def _should_launch_mpi(item):
         return False
     if item.config.getoption("--nompi"):
         return False
-    return item.stash.get(_NPROCS_KEY, 1) > 1
+    if item.stash.get(_NPROCS_KEY, 1) <= 1:
+        return False
+    # fall back to the normal protocol when MPI is unavailable, so the
+    # skip in pytest_runtest_setup fires instead of spawning `mpirun`
+    # with a missing executable
+    return _have_mpi4py() and _find_mpirun() is not None
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -588,6 +593,19 @@ class _SlotLimiter(object):
 
     @staticmethod
     def _pid_alive(pid):
+        if sys.platform == "win32":
+            # os.kill(pid, 0) is NOT a liveness probe on Windows -- any
+            # signal other than CTRL_C/CTRL_BREAK calls TerminateProcess
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not handle:
+                return False
+            # WaitForSingleObject(0) == WAIT_TIMEOUT (0x102) => still running
+            alive = kernel32.WaitForSingleObject(handle, 0) == 0x102
+            kernel32.CloseHandle(handle)
+            return alive
         try:
             os.kill(pid, 0)
         except OSError:
