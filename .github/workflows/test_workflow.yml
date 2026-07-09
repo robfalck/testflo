@@ -96,7 +96,7 @@ jobs:
         run: |
           cd $HOME
 
-          pixi run -e ${{ matrix.PIXI_ENV }} testflo --skip_dir=pytest_tests testflo.tests -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
+          pixi run -m $GITHUB_WORKSPACE/pyproject.toml -e ${{ matrix.PIXI_ENV }} testflo --skip_dir=pytest_tests testflo.tests -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
 
           if [[ $RC -ne 1 ]]; then
             echo "Expected some tests to fail."
@@ -130,7 +130,7 @@ jobs:
         run: |
           cd $HOME
 
-          pixi run -e ${{ matrix.PIXI_ENV }} testflo --skip_dir=pytest_tests testflo.tests -n 1 -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
+          pixi run -m $GITHUB_WORKSPACE/pyproject.toml -e ${{ matrix.PIXI_ENV }} testflo --skip_dir=pytest_tests testflo.tests -n 1 -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
 
           if [[ $RC -ne 1 ]]; then
             echo "Expected some tests to fail."
