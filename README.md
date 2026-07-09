@@ -178,5 +178,115 @@ or install from PYPI using:
 If you try it out and find any problems, submit them as issues on github at
 https://github.com/OpenMDAO/testflo.
 
+
+pytest plugin
+-------------
+
+testflo ships a pytest plugin that brings testflo's MPI execution model to pytest suites.  It is registered automatically when testflo is installed, so no `conftest.py` changes are needed.
+
+### Marking tests as parallel
+
+```python
+import pytest
+
+@pytest.mark.parallel(4)
+def test_foo(comm):
+    assert comm.size == 4
+```
+
+`@pytest.mark.parallel(N)` is the canonical form.  `nprocs=N` is accepted as
+a keyword argument for backward compatibility.  To parametrize over multiple
+sizes, pass a list:
+
+```python
+@pytest.mark.parallel([2, 4])
+def test_bar(comm):
+    assert comm.allreduce(1) == comm.size
+```
+
+Existing testflo-style `unittest.TestCase` classes with an `N_PROCS` attribute
+work unchanged:
+
+```python
+class TestMPI(unittest.TestCase):
+    N_PROCS = 2
+
+    def test_something(self):
+        from mpi4py import MPI
+        assert MPI.COMM_WORLD.size == 2
+```
+
+The `comm` fixture provides `MPI.COMM_WORLD` inside the spawned mpirun
+process, or a size-1 `FakeComm` for serial tests and when `--nompi` is used.
+
+### Running mixed serial/parallel suites with pytest-xdist
+
+MPI tests must not run concurrently with each other — each spawns its own
+`mpirun`, so N simultaneous MPI tests means N×nprocs processes at once.
+
+When pytest-xdist is active (`-n`), the plugin automatically applies
+`--dist loadgroup` unless you have set `--dist` explicitly.  Under
+`--dist loadgroup`, all MPI tests are pinned to a single xdist worker and run
+in series relative to each other, while serial tests distribute freely across
+all workers and run in parallel.  No extra flags are needed:
+
+```
+pytest -n auto
+```
+
+If your machine has enough cores to run multiple MPI tests concurrently, use
+`--mpi-workers=N` to spread MPI tests across N workers.  Each worker still
+runs its share in series, so at most N mpirun jobs are live at once:
+
+```
+pytest -n 4 --mpi-workers=2
+```
+
+To additionally cap the total number of MPI ranks in flight, combine with
+`--mpi-concurrent-slots=N`:
+
+```
+pytest -n 4 --mpi-workers=2 --mpi-concurrent-slots=8
+```
+
+### Guarding against deadlocks
+
+A rank-local failure before a collective call (`barrier`, `allreduce`, etc.)
+will cause the other ranks to hang.  Use `--mpi-timeout` to break these:
+
+```
+pytest --mpi-timeout=60
+```
+
+The spawned mpirun is killed after the timeout and the test is reported failed.
+
+### Running without MPI
+
+`--nompi` runs parallel-marked tests in-process on a `FakeComm` of size 1,
+identical to `testflo --nompi`.  Useful for quick iteration or environments
+without MPI installed:
+
+```
+pytest --nompi
+```
+
+### Known issues
+
+**MPICH on macOS**: A networking issue exists when using MPICH with OFI (OpenFabrics Interface) on macOS
+in edge cases where MPI processes are forcefully terminated (e.g., `SIGKILL` from a timeout).
+This manifests as an error during MPI finalization: `OFI poll failed (default nic=...: Input/output error)`.
+This is not encountered in normal usage but may appear in stress tests or timeout scenarios.
+If encountered, switch to OpenMPI as a workaround.
+
+### Options summary
+
+| Option | Description |
+|--------|-------------|
+| `--nompi` | Run parallel tests in-process on a FakeComm (size 1) |
+| `--mpi-workers=N` | Number of xdist workers dedicated to MPI tests (default: 1); `--dist loadgroup` is applied automatically |
+| `--mpi-timeout=N` | Kill spawned mpirun after N seconds (deadlock guard) |
+| `--mpirun-exe=PATH` | Path to mpirun/mpiexec if not on PATH |
+| `--mpi-concurrent-slots=N` | Max total MPI ranks in flight across all xdist workers |
+
 [1]: https://badge.fury.io/py/testflo.svg "PyPI Version"
 [2]: https://badge.fury.io/py/testflo "testflo @PyPI"
