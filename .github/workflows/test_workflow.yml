@@ -166,11 +166,12 @@ jobs:
         env:
           PIXI_ENV: pytest${{ matrix.PIXI_ENV == 'mpich' && '-mpich' || '' }}
         run: |
+          eval "$(pixi shell-hook -s bash -e $PIXI_ENV)"
           cd $HOME
 
-          pixi run -e $PIXI_ENV pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --import-mode=importlib
-          pixi run -e $PIXI_ENV pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --mpi-workers=2 --import-mode=importlib
-          pixi run -e $PIXI_ENV pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --nompi --import-mode=importlib
+          pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --import-mode=importlib
+          pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --mpi-workers=2 --import-mode=importlib
+          pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --nompi --import-mode=importlib
 
       - name: Notify slack of failure
         uses: act10ns/slack@v2.0.0
