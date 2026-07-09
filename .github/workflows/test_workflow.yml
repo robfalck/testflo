@@ -72,7 +72,7 @@ jobs:
       - name: Setup pixi
         uses: prefix-dev/setup-pixi@v0.10.0
         with:
-          pixi-version: v0.66.0
+          pixi-version: v0.72.0
           environments: ${{ matrix.PIXI_ENV }}
 
       - name: Install testflo
