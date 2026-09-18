@@ -73,9 +73,6 @@ CHILD_FLAG = "TESTFLO_PYTEST_CHILD"
 RESULTS_FLAG = "TESTFLO_PYTEST_RESULTS"
 """Path of the JSON results file the child's rank 0 writes."""
 
-MAX_NPROCS_FLAG = "TESTFLO_PYTEST_MAX_NPROCS"
-"""Optional env var limiting the maximum number of processes per test."""
-
 DEFAULT_NPROCS = 2
 """nprocs used when ``@pytest.mark.parallel`` is given with no arguments."""
 
@@ -108,16 +105,9 @@ def _under_mpi():
     return _is_child() or _outer_world_size() > 1
 
 
-@functools.lru_cache(maxsize=None)
-def _find_mpirun():
-    exe = os.environ.get("TESTFLO_PYTEST_MPIRUN")
-    if exe:
-        return exe
-    for name in ("mpirun", "mpiexec"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
+_MPIRUN_KEY = pytest.StashKey()
+"""Path of the mpirun/mpiexec to spawn with (None if none was found);
+resolved once in ``pytest_configure``."""
 
 
 @functools.lru_cache(maxsize=None)
@@ -291,9 +281,9 @@ def pytest_configure(config):
         "multiprocessing-only tests run in-process. The test's core cost "
         "is max(N,1)*max(M,1), used by --max-concurrent-cores.")
 
-    if config.getoption("--mpirun-exe"):
-        os.environ["TESTFLO_PYTEST_MPIRUN"] = config.getoption("--mpirun-exe")
-        _find_mpirun.cache_clear()
+    config.stash[_MPIRUN_KEY] = (config.getoption("--mpirun-exe")
+                                 or shutil.which("mpirun")
+                                 or shutil.which("mpiexec"))
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_cmdline_main(config):
@@ -357,16 +347,6 @@ def pytest_generate_tests(metafunc):
 
     marker, = markers
     nprocss, _ = _parse_marker(marker)
-
-    max_nprocs = os.environ.get(MAX_NPROCS_FLAG)
-    if max_nprocs is not None:
-        max_nprocs = int(max_nprocs)
-        for nprocs in nprocss:
-            if nprocs > max_nprocs:
-                raise pytest.UsageError(
-                    f"Requested a parallel test with too many ranks "
-                    f"({nprocs} > {MAX_NPROCS_FLAG}={max_nprocs})")
-
     if len(nprocss) > 1:
         metafunc.fixturenames.append("_nprocs")
         metafunc.parametrize("_nprocs", nprocss, ids=lambda n: f"nprocs={n}")
@@ -385,7 +365,7 @@ def pytest_collection_modifyitems(config, items):
     if not _under_mpi() and not config.getoption("--nompi"):
         if not _have_mpi4py():
             no_mpi = "mpi4py is required to run parallel tests (or use --nompi)"
-        elif _find_mpirun() is None:
+        elif config.stash[_MPIRUN_KEY] is None:
             no_mpi = ("mpirun/mpiexec was not found in the system path "
                       "(or use --nompi)")
 
@@ -463,62 +443,37 @@ def _mpi_barrier_finalize(request):
 # child mode: run naturally, gather at the end
 # ---------------------------------------------------------------------------
 
-_child_results = {}
+_child_results = collections.defaultdict(list)
+"""nodeid -> every report pytest produced for it on this rank (setup, call,
+teardown, or a failed collection).  Reduction to one outcome per rank
+happens in the launcher (``_aggregate_rank_results``)."""
 
 
-def _record_child_report(report):
-    """Keep the 'worst' report per nodeid: a failed setup/call/teardown
-    beats a pass; a call report beats setup/teardown noise."""
-    nodeid = report.nodeid
-    entry = {
-        "when": report.when,
-        "outcome": report.outcome,
-        "longrepr": str(report.longrepr) if report.longrepr is not None else None,
-        "sections": [list(s) for s in report.sections],
-        "duration": getattr(report, "duration", 0.0),
-        "wasxfail": getattr(report, "wasxfail", None),
-    }
-    prev = _child_results.get(nodeid)
-    if prev is None:
-        _child_results[nodeid] = entry
-        return
-    # accumulate captured output sections across phases
-    entry["sections"] = prev["sections"] + entry["sections"]
-    entry["duration"] = prev["duration"] + entry["duration"]
-    if prev["outcome"] != "passed" and entry["outcome"] == "passed":
-        # keep the failure/skip info, but keep accumulated sections
-        prev["sections"] = entry["sections"]
-        prev["duration"] = entry["duration"]
-        return
-    if prev.get("wasxfail") is not None and entry.get("wasxfail") is None:
-        entry["wasxfail"] = prev["wasxfail"]
-    _child_results[nodeid] = entry
+def _serialize_report(report):
+    longrepr = report.longrepr
+    if longrepr is not None and not isinstance(longrepr, tuple):
+        # skips carry a plain (path, lineno, reason) tuple; anything else
+        # is a repr object that only needs to survive as text
+        longrepr = str(longrepr)
+    return {"when": report.when,
+            "outcome": report.outcome,
+            "longrepr": longrepr,
+            "sections": [list(sec) for sec in report.sections],
+            "duration": getattr(report, "duration", 0.0),
+            "wasxfail": getattr(report, "wasxfail", None)}
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_logreport(report):
-    if not _is_child():
-        return
-    if report.when == "call" or report.outcome != "passed":
-        _record_child_report(report)
-    elif report.when == "setup" and report.nodeid not in _child_results:
-        # remember setup sections so captured fixture output isn't lost
-        _record_child_report(report)
+    if _is_child():
+        _child_results[report.nodeid].append(_serialize_report(report))
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_collectreport(report):
-    if not _is_child():
-        return
-    if report.failed:
-        _child_results[report.nodeid or "<collection>"] = {
-            "when": "collect",
-            "outcome": "failed",
-            "longrepr": str(report.longrepr),
-            "sections": [],
-            "duration": 0.0,
-            "wasxfail": None,
-        }
+    if _is_child() and report.failed:
+        _child_results[report.nodeid or "<collection>"].append(
+            _serialize_report(report))
 
 
 @pytest.hookimpl(trylast=True)
@@ -742,8 +697,11 @@ class _SlotLimiter(object):
     @staticmethod
     def _pid_alive(pid):
         if sys.platform == "win32":
-            # os.kill(pid, 0) is NOT a liveness probe on Windows -- any
-            # signal other than CTRL_C/CTRL_BREAK calls TerminateProcess
+            # os.kill(pid, 0) only does OpenProcess here, which still
+            # succeeds for a process that has *exited* while any handle to
+            # it remains open -- e.g. the xdist controller's Popen handle
+            # on a crashed worker.  Ask the process object whether it is
+            # actually still running.
             import ctypes
             SYNCHRONIZE = 0x00100000
             kernel32 = ctypes.windll.kernel32
@@ -938,7 +896,7 @@ def _run_mpi_item(item):
     import tempfile
 
     config = item.config
-    mpirun = _find_mpirun()
+    mpirun = config.stash[_MPIRUN_KEY]
     timeout = config.getoption("--mpi-timeout")
 
     fd, results_path = tempfile.mkstemp(prefix="testflo_pytest_",
@@ -1011,22 +969,23 @@ def _aggregate_rank_results(item, data):
 
     for payload in sorted(data["ranks"], key=lambda p: p["rank"]):
         rank = payload["rank"]
-        results = payload["results"]
-        if not results:
+        # one nodeid per child invocation (plus possible collect errors)
+        reports = [r for reps in payload["results"].values() for r in reps]
+        if not reports:
             continue
         n_with_results += 1
-        # one nodeid per child invocation (plus possible collect errors)
-        for nodeid, res in results.items():
-            duration = max(duration, res.get("duration") or 0.0)
-            if res.get("wasxfail") is not None:
-                wasxfail = res["wasxfail"]
-            for name, content in res.get("sections", ()):
-                if content:
-                    sections.append((f"rank {rank}: {name}", content))
-            if res["outcome"] == "failed":
-                failures.append((rank, res["longrepr"] or "(no traceback)"))
-            elif res["outcome"] == "skipped":
-                skips.append((rank, res["longrepr"] or "skipped"))
+        duration = max(duration, sum(r["duration"] or 0.0 for r in reports))
+        for r in reports:
+            if r["wasxfail"] is not None:
+                wasxfail = r["wasxfail"]
+            sections.extend((f"rank {rank}: {name}", content)
+                            for name, content in r["sections"] if content)
+        failed = [r for r in reports if r["outcome"] == "failed"]
+        skipped = [r for r in reports if r["outcome"] == "skipped"]
+        if failed:
+            failures.append((rank, failed[0]["longrepr"] or "(no traceback)"))
+        elif skipped:
+            skips.append((rank, skipped[0]["longrepr"] or "skipped"))
 
     if n_with_results == 0:
         return _make_report(item, "call", "failed",
@@ -1054,15 +1013,11 @@ def _aggregate_rank_results(item, data):
             # xfail: pytest represents this as a skipped call report
             # carrying a `wasxfail` attribute -> terminal shows XFAIL
             return _make_report(item, "call", "skipped",
-                                longrepr=skips[0][1], sections=sections,
+                                longrepr=str(skips[0][1]), sections=sections,
                                 duration=duration, wasxfail=wasxfail)
         reason = skips[0][1]
-        if reason.startswith("("):  # repr of a (path, lineno, reason) tuple
-            try:
-                import ast
-                reason = ast.literal_eval(reason)[2]
-            except Exception:
-                pass
+        if isinstance(reason, (list, tuple)):   # child's (path, lineno, reason)
+            reason = reason[2]
         longrepr = (str(item.path), item.location[1], str(reason))
         return _make_report(item, "call", "skipped", longrepr=longrepr,
                             sections=sections, duration=duration)

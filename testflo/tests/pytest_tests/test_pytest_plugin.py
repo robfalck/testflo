@@ -767,6 +767,65 @@ def test_mpi_sizes_parametrized_with_pool(pytester):
     result.stdout.fnmatch_lines(["*requires 6 cores*"])
 
 
+def test_rank_report_aggregation(pytester):
+    """The launcher reduces the raw per-phase reports each rank ships to
+    one outcome per rank, then one call report per test.  Exercised with
+    real pytest reports so it does not need MPI."""
+    import json
+    from testflo.pytest_plugin import (_serialize_report,
+                                       _aggregate_rank_results)
+    pytester.makepyfile(
+        """
+        import pytest
+
+        def test_pass(): print("out"); assert True
+        def test_fail(): assert 0, "boom"
+        def test_skip(): pytest.skip("nope")
+        @pytest.mark.xfail(reason="known")
+        def test_xfail(): assert 0
+        """
+    )
+    reprec = pytester.inline_run("-p", "no:cacheprovider", "--oversubscribe")
+    by_node = {}
+    for rep in reprec.getreports("pytest_runtest_logreport"):
+        by_node.setdefault(rep.nodeid, []).append(_serialize_report(rep))
+    items = {i.name: i for i in pytester.getitems(
+        pytester.path.joinpath("test_rank_report_aggregation.py").read_text())}
+
+    def agg(name, ranks):
+        nodeid, = (n for n in by_node if n.endswith("::" + name))
+        data = {"nprocs": len(ranks),
+                "ranks": [{"rank": r, "results": {nodeid: by_node[nodeid]}}
+                          for r in ranks]}
+        # the real path goes through the JSON results file
+        return _aggregate_rank_results(items[name],
+                                       json.loads(json.dumps(data)))
+
+    rep = agg("test_pass", [0, 1])
+    assert rep.outcome == "passed"
+    assert ("rank 1: Captured stdout call", "out\n") in rep.sections
+
+    rep = agg("test_fail", [0, 1, 2])
+    assert rep.outcome == "failed"
+    assert "rank 0 of 3" in rep.longrepr and "boom" in rep.longrepr
+
+    rep = agg("test_skip", [0])
+    assert rep.outcome == "skipped"
+    assert rep.longrepr[2] == "Skipped: nope"   # (path, lineno, reason) form
+
+    rep = agg("test_xfail", [0, 1])
+    assert rep.outcome == "skipped" and rep.wasxfail == "known"
+
+    # a rank that failed plus one that passed -> failed, passing rank noted
+    nodeid_f, = (n for n in by_node if n.endswith("::test_fail"))
+    nodeid_p, = (n for n in by_node if n.endswith("::test_pass"))
+    data = {"nprocs": 2, "ranks": [
+        {"rank": 0, "results": {nodeid_f: by_node[nodeid_f]}},
+        {"rank": 1, "results": {nodeid_f: by_node[nodeid_p]}}]}
+    rep = _aggregate_rank_results(items["test_fail"], data)
+    assert rep.outcome == "failed" and "(ranks [1] passed)" in rep.longrepr
+
+
 def test_slot_limiter_prunes_dead_holders(tmp_path, monkeypatch):
     """Cores held by a worker that died are reclaimed on the next acquire,
     so a crashed worker cannot permanently starve the budget."""
@@ -779,7 +838,9 @@ def test_slot_limiter_prunes_dead_holders(tmp_path, monkeypatch):
 
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait()
-    dead_pid = proc.pid  # process has exited; its pid is no longer alive
+    # keep `proc` (and so its Windows process handle) alive: the pruner
+    # must recognise an exited process even while a handle to it is open
+    dead_pid = proc.pid
 
     limiter = _SlotLimiter(4)
     with open(limiter.state_path, "w") as f:
@@ -792,20 +853,3 @@ def test_slot_limiter_prunes_dead_holders(tmp_path, monkeypatch):
     limiter.release()
     state = json.load(open(limiter.state_path))
     assert not state["holders"]
-
-
-def test_max_nprocs_guard(pytester, monkeypatch):
-    monkeypatch.setenv("TESTFLO_PYTEST_MAX_NPROCS", "4")
-    pytester.makepyfile(
-        """
-        import pytest
-
-        @pytest.mark.parallel(nprocs=8)
-        def test_too_big(comm):
-            pass
-        """
-    )
-    result = pytester.runpytest_subprocess("-v")
-    assert result.ret != 0
-    combined = result.stdout.str() + result.stderr.str()
-    assert "too many ranks" in combined
