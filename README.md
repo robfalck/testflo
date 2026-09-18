@@ -194,8 +194,8 @@ def test_foo(comm):
     assert comm.size == 4
 ```
 
-`@pytest.mark.parallel(N)` is the canonical form.  `nprocs=N` is accepted as
-a keyword argument for backward compatibility.  To parametrize over multiple
+`@pytest.mark.parallel(N)` is the canonical form; `mpi=N` and the older
+`nprocs=N` are equivalent keyword forms.  To parametrize over multiple
 sizes, pass a list:
 
 ```python
@@ -203,6 +203,34 @@ sizes, pass a list:
 def test_bar(comm):
     assert comm.allreduce(1) == comm.size
 ```
+
+### Multiprocessing tests and core accounting
+
+Not every parallel test needs MPI.  A test that spins up its own pool of
+worker processes (e.g. `multiprocessing.Pool(4)`) can declare that with the
+`multiprocessing` keyword.  No `mpirun` is spawned — the test runs in-process
+with a size-1 `FakeComm` — but the plugin now knows how many cores it will
+use:
+
+```python
+@pytest.mark.parallel(multiprocessing=4)
+def test_pool():
+    with multiprocessing.Pool(4) as pool:
+        ...
+```
+
+The two can be combined when each MPI rank fans out further.  A test's core
+cost is `max(mpi, 1) * max(multiprocessing, 1)`:
+
+| Marker | mpirun ranks | cores |
+|--------|--------------|-------|
+| `parallel(4)` / `parallel(mpi=4)` | 4 | 4 |
+| `parallel(multiprocessing=4)` | none | 4 |
+| `parallel(mpi=4, multiprocessing=2)` | 4 | 8 |
+
+Both kinds are selected by `-m parallel`, and both count against the core
+budget (below).  The existing `N_PROCS` class attribute is
+equivalent to `mpi=N_PROCS`.
 
 Existing testflo-style `unittest.TestCase` classes with an `N_PROCS` attribute
 work unchanged:
@@ -221,33 +249,44 @@ process, or a size-1 `FakeComm` for serial tests and when `--nompi` is used.
 
 ### Running mixed serial/parallel suites with pytest-xdist
 
-MPI tests must not run concurrently with each other — each spawns its own
-`mpirun`, so N simultaneous MPI tests means N×nprocs processes at once.
-
-When pytest-xdist is active (`-n`), the plugin automatically applies
-`--dist loadgroup` unless you have set `--dist` explicitly.  Under
-`--dist loadgroup`, all MPI tests are pinned to a single xdist worker and run
-in series relative to each other, while serial tests distribute freely across
-all workers and run in parallel.  No extra flags are needed:
+Every test is distributed freely by xdist; there is no special grouping of
+parallel tests.  Instead, each test reserves the cores it needs from a shared
+budget just before it runs (see below), so a 4-rank MPI test simply waits
+until four cores are free, and serial tests keep flowing around it in the
+meantime.  No extra flags are needed:
 
 ```
 pytest -n auto
 ```
 
-If your machine has enough cores to run multiple MPI tests concurrently, use
-`--mpi-workers=N` to spread MPI tests across N workers.  Each worker still
-runs its share in series, so at most N mpirun jobs are live at once:
+When xdist is active the plugin defaults to `--dist worksteal` (unless you
+set `--dist` yourself): a worker waiting for cores cannot hand its test back,
+but idle workers steal the tests queued behind it, so nothing else is held up.
+
+### Core budget
+
+By default a test only starts when the cores it needs are free.  A serial
+test costs 1 core and a parallel test `max(mpi,1) * max(multiprocessing,1)`;
+the total cost of every test in flight across all xdist workers is capped at
+the number of cores available to the pytest process.  Serial tests count too,
+because a worker busy with one is a busy core.
+
+Waiting requests are served in order, so a big test cannot be starved: once
+an 8-rank test is waiting on an 8-core machine, new serial tests stop
+starting ahead of it, the running ones finish, and it runs next.  A test whose
+cost alone exceeds the budget is reported as failed rather than silently
+oversubscribing the machine.
+
+Override the cap with `--max-concurrent-cores=N`, or remove it altogether
+with `--oversubscribe` (or `TESTFLO_PYTEST_OVERSUBSCRIBE=1`):
 
 ```
-pytest -n 4 --mpi-workers=2
+pytest -n 4 --max-concurrent-cores=8
+pytest --oversubscribe
 ```
 
-To additionally cap the total number of MPI ranks in flight, combine with
-`--mpi-concurrent-slots=N`:
-
-```
-pytest -n 4 --mpi-workers=2 --mpi-concurrent-slots=8
-```
+An explicit `--max-concurrent-cores` takes precedence over `--oversubscribe`.
+(`--mpi-concurrent-slots` is a deprecated alias for `--max-concurrent-cores`.)
 
 ### Guarding against deadlocks
 
@@ -283,10 +322,11 @@ If encountered, switch to OpenMPI as a workaround.
 | Option | Description |
 |--------|-------------|
 | `--nompi` | Run parallel tests in-process on a FakeComm (size 1) |
-| `--mpi-workers=N` | Number of xdist workers dedicated to MPI tests (default: 1); `--dist loadgroup` is applied automatically |
 | `--mpi-timeout=N` | Kill spawned mpirun after N seconds (deadlock guard) |
 | `--mpirun-exe=PATH` | Path to mpirun/mpiexec if not on PATH |
-| `--mpi-concurrent-slots=N` | Max total MPI ranks in flight across all xdist workers |
+| `--max-concurrent-cores=N` | Max total core cost of tests in flight (serial = 1) across all xdist workers (default: cores available to the process) |
+| `--oversubscribe` | Remove the core budget entirely (env: `TESTFLO_PYTEST_OVERSUBSCRIBE=1`) |
+| `--mpi-concurrent-slots=N` | Deprecated alias for `--max-concurrent-cores` |
 
 [1]: https://badge.fury.io/py/testflo.svg "PyPI Version"
 [2]: https://badge.fury.io/py/testflo "testflo @PyPI"

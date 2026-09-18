@@ -170,7 +170,6 @@ jobs:
           cd $HOME
 
           pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --import-mode=importlib
-          pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --mpi-workers=2 --import-mode=importlib
           pytest $GITHUB_WORKSPACE/testflo/tests/pytest_tests/test_pytest_plugin.py -n auto --nompi --import-mode=importlib
 
       - name: Notify slack of failure

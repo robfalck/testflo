@@ -32,13 +32,13 @@ dependencies = [
 # only activates under pytest anyway).
 [project.optional-dependencies]
 pytest = [
-    "pytest>=7.0",
+    "pytest>=7.4",
 ]
 mpi = [
     "mpi4py",
 ]
 test = [
-    "pytest>=7.0",
+    "pytest>=7.4",
     "mpi4py",
     "pytest-xdist",
 ]
@@ -67,7 +67,7 @@ include = [
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64", "osx-arm64"]
+platforms = ["linux-64", "osx-arm64", "win-64"]
 exclude-newer = "7d"
 
 [tool.pixi.dependencies]
@@ -81,23 +81,33 @@ testflo = { path = ".", editable = true }
 test = "testflo --skip_dir=pytest_tests testflo/tests/"
 
 # ---------------------------------------------------------------------------
-# MPI implementations
+# MPI implementations.  conda-forge has no MPI packages for win-64, so the
+# MPI deps are targeted at linux/osx only; on Windows the same environments
+# solve without them and MPI-dependent tests are skipped.
 # ---------------------------------------------------------------------------
 
-[tool.pixi.feature.openmpi.dependencies]
+[tool.pixi.feature.openmpi.target.linux-64.dependencies]
 openmpi = "*"
 mpi4py  = "*"
 
-[tool.pixi.feature.mpich.dependencies]
-mpich = "*"
+[tool.pixi.feature.openmpi.target.osx-arm64.dependencies]
+openmpi = "*"
 mpi4py  = "*"
+
+[tool.pixi.feature.mpich.target.linux-64.dependencies]
+mpich  = "*"
+mpi4py = "*"
+
+[tool.pixi.feature.mpich.target.osx-arm64.dependencies]
+mpich  = "*"
+mpi4py = "*"
 
 # ---------------------------------------------------------------------------
 # pytest feature — extends the default environment with pytest tooling
 # ---------------------------------------------------------------------------
 
 [tool.pixi.feature.pytest.pypi-dependencies]
-pytest       = ">=7.0"
+pytest       = ">=7.4"
 pytest-xdist = "*"
 
 [tool.pixi.feature.pytest.tasks]
