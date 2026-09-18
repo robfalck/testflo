@@ -5,22 +5,31 @@ Design
 ------
 This plugin brings testflo's MPI execution model to pytest:
 
-* Tests marked with ``@pytest.mark.parallel(mpi=N)`` (``parallel(N)`` and
-  ``parallel(nprocs=N)`` are aliases) or belonging to a unittest.TestCase
-  with an ``N_PROCS`` class attribute (testflo syntax) are executed under a
-  spawned ``mpirun -n N`` subprocess.
+* Tests marked with ``@pytest.mark.mpi(N)`` (``mpi(nprocs=N)`` is an alias)
+  or belonging to a unittest.TestCase with an ``N_PROCS`` class attribute
+  (testflo syntax) are executed under a spawned ``mpirun -n N`` subprocess.
+  A bare ``@pytest.mark.mpi`` defaults to ``DEFAULT_NPROCS`` ranks.
 
-* ``@pytest.mark.parallel(multiprocessing=M)`` declares a test that does
-  *not* need MPI but will spin up its own pool of M worker processes.  Such
-  tests run in-process on a ``FakeComm``; the marker exists so the plugin
-  can account for the cores they use.  The two may be combined:
-  ``parallel(mpi=N, multiprocessing=M)`` costs ``N * M`` cores (each rank
+* ``@pytest.mark.multiprocessing(M)`` declares a test that does *not* need
+  MPI but will spin up its own pool of M worker processes; ``M`` is
+  required (a bare ``@pytest.mark.multiprocessing`` raises ``UsageError`` --
+  there is no sensible default pool size).  Such tests run in-process on a
+  ``FakeComm``; the marker exists so the plugin can account for the cores
+  they use.  ``mpi`` and ``multiprocessing`` are independent and compose
+  freely on the same test: ``@pytest.mark.mpi(N)`` plus
+  ``@pytest.mark.multiprocessing(M)`` costs ``N * M`` cores (each rank
   spawns its own pool); a serial test costs 1.  By default a test only
   starts when its core cost fits within the cores available to the machine,
   counting every test already in flight across all pytest-xdist workers
   (serial ones included, since a busy worker is a busy core);
   ``--max-concurrent-cores`` overrides the budget and ``--oversubscribe``
   removes it.
+
+* Being independent markers, they are independently selectable:
+  ``pytest -m 'not mpi'`` runs every test that does not need ``mpirun`` --
+  including ``multiprocessing``-only tests -- without the overhead or hang
+  risk of spawning MPI, which is useful for a fast local/CI pass that still
+  exercises multiprocessing scaling.
 
 * Inside that subprocess, *every rank* runs the test body naturally.  Plain
   ``assert`` statements work per-rank -- no special ``parallel_assert`` is
@@ -77,7 +86,7 @@ RESULTS_FLAG = "TESTFLO_PYTEST_RESULTS"
 """Path of the JSON results file the child's rank 0 writes."""
 
 DEFAULT_NPROCS = 2
-"""nprocs used when ``@pytest.mark.parallel`` is given with no arguments."""
+"""nprocs used when a bare ``@pytest.mark.mpi`` is given with no arguments."""
 
 
 def _is_child():
@@ -146,51 +155,63 @@ def _as_tuple(arg):
     return tuple(arg) if isinstance(arg, collections.abc.Iterable) else (arg,)
 
 
-_BAD_MARKER_MSG = (
-    "Bad arguments given to parallel marker; expected parallel(N), "
-    "parallel(mpi=N), parallel([N1, N2, ...]), parallel(multiprocessing=M) "
-    "or parallel(mpi=N, multiprocessing=M)")
+_BAD_MPI_MARKER_MSG = (
+    "Bad arguments given to mpi marker; expected mpi(N), mpi(nprocs=N) or "
+    "mpi([N1, N2, ...])")
+
+_BAD_MP_MARKER_MSG = (
+    "Bad arguments given to multiprocessing marker; expected "
+    "multiprocessing(M) with M a positive int -- unlike mpi, there is no "
+    "default pool size")
 
 
-def _parse_marker(marker):
-    """Return ``(mpi_sizes, multiprocessing)`` requested by a parallel marker.
+def _parse_mpi_marker(marker):
+    """Return the tuple of MPI communicator sizes requested by an ``mpi``
+    marker (more than one entry means the test is parametrized over sizes).
 
-    ``mpi_sizes`` is a tuple of MPI communicator sizes (more than one entry
-    means the test is parametrized over sizes); ``multiprocessing`` is the
-    number of worker processes the test itself will spawn (0 if none).
-
-    Accepted forms: bare ``parallel`` (-> ``DEFAULT_NPROCS`` ranks),
-    ``parallel(N)``, ``parallel([N1, N2])``, ``parallel(mpi=N)``,
-    ``parallel(nprocs=N)`` (back-compat alias for ``mpi``),
-    ``parallel(multiprocessing=M)`` and ``parallel(mpi=N, multiprocessing=M)``.
+    Accepted forms: bare ``mpi`` (-> ``DEFAULT_NPROCS`` ranks), ``mpi(N)``,
+    ``mpi([N1, N2])``, ``mpi(nprocs=N)`` and ``mpi(nprocs=[N1, N2])``.
     """
     kwargs = dict(marker.kwargs)
-    mp = kwargs.pop("multiprocessing", 0)
-    mpi_kw = [k for k in ("mpi", "nprocs") if k in kwargs]
+    nprocs_kw = "nprocs" in kwargs
 
-    if kwargs and set(kwargs) - {"mpi", "nprocs"}:
-        raise pytest.UsageError(_BAD_MARKER_MSG)
-    if len(marker.args) > 1 or (marker.args and mpi_kw) or len(mpi_kw) > 1:
-        raise pytest.UsageError(_BAD_MARKER_MSG)
+    if kwargs and set(kwargs) - {"nprocs"}:
+        raise pytest.UsageError(_BAD_MPI_MARKER_MSG)
+    if len(marker.args) > 1 or (marker.args and nprocs_kw):
+        raise pytest.UsageError(_BAD_MPI_MARKER_MSG)
 
     if marker.args:
         mpi = _as_tuple(marker.args[0])
-    elif mpi_kw:
-        mpi = _as_tuple(kwargs[mpi_kw[0]])
-    elif "multiprocessing" in marker.kwargs:
-        mpi = (0,)   # multiprocessing-only: no mpirun
+    elif nprocs_kw:
+        mpi = _as_tuple(kwargs["nprocs"])
     else:
         mpi = (DEFAULT_NPROCS,)
 
-    if (not isinstance(mp, numbers.Integral) or isinstance(mp, bool)
-            or mp < 0):
-        raise pytest.UsageError(
-            "parallel marker: multiprocessing must be a non-negative int")
-    if not mpi or not all(isinstance(n, numbers.Integral) and n >= 0
+    if not mpi or not all(isinstance(n, numbers.Integral)
+                          and not isinstance(n, bool) and n >= 0
                           for n in mpi):
-        raise pytest.UsageError(_BAD_MARKER_MSG)
+        raise pytest.UsageError(_BAD_MPI_MARKER_MSG)
 
-    return tuple(int(n) for n in mpi), int(mp)
+    return tuple(int(n) for n in mpi)
+
+
+def _parse_mp_marker(marker):
+    """Return the pool size ``M`` requested by a ``multiprocessing`` marker.
+
+    Only ``multiprocessing(M)`` is accepted (positional, no kwargs); a bare
+    ``multiprocessing`` marker has no sensible default and is rejected.
+    """
+    if not marker.args and not marker.kwargs:
+        raise pytest.UsageError(_BAD_MP_MARKER_MSG)
+    if marker.kwargs or len(marker.args) != 1:
+        raise pytest.UsageError(_BAD_MP_MARKER_MSG)
+
+    mp = marker.args[0]
+    if (not isinstance(mp, numbers.Integral) or isinstance(mp, bool)
+            or mp < 1):
+        raise pytest.UsageError(_BAD_MP_MARKER_MSG)
+
+    return int(mp)
 
 
 def _cores(mpi, multiprocessing):
@@ -210,27 +231,31 @@ _SPEC_KEY = pytest.StashKey()
 def _parallel_spec_for_item(item):
     """Return the ``ParallelSpec`` for a collected test item.
 
+    ``mpi`` and ``multiprocessing`` are resolved independently.
+
     Resolution order for the MPI size:
-      1. ``[nprocs=N]`` parametrization (from a multi-valued parallel marker)
-      2. ``@pytest.mark.parallel`` marker
+      1. ``[nprocs=N]`` parametrization (from a multi-valued ``mpi`` marker)
+      2. ``@pytest.mark.mpi`` marker
       3. testflo-style ``N_PROCS`` class attribute
     """
-    marker = item.get_closest_marker("parallel")
-    mp = 0
-    if marker is not None:
-        mpis, mp = _parse_marker(marker)
+    mpi_marker = item.get_closest_marker("mpi")
+    if mpi_marker is not None:
+        mpis = _parse_mpi_marker(mpi_marker)
         if hasattr(item, "callspec") and "_nprocs" in item.callspec.params:
             mpi = int(item.callspec.params["_nprocs"])
         elif len(mpis) != 1:
             # should have been parametrized away in pytest_generate_tests
             raise pytest.UsageError(
-                f"multi-valued parallel marker on {item.nodeid} was not "
+                f"multi-valued mpi marker on {item.nodeid} was not "
                 "parametrized; is pytest_generate_tests being blocked?")
         else:
             mpi = mpis[0]
     else:
         n = getattr(getattr(item, "cls", None), "N_PROCS", None)
         mpi = int(n) if n is not None else 1
+
+    mp_marker = item.get_closest_marker("multiprocessing")
+    mp = _parse_mp_marker(mp_marker) if mp_marker is not None else 0
 
     return ParallelSpec(mpi, mp, _cores(mpi, mp))
 
@@ -243,7 +268,7 @@ def pytest_addoption(parser):
     group = parser.getgroup("testflo", "testflo-style MPI execution")
     group.addoption(
         "--nompi", action="store_true", default=False,
-        help="run parallel-marked tests in the current process on a "
+        help="run mpi-marked tests in the current process on a "
              "communicator of size 1 instead of spawning MPI (testflo's "
              "--nompi).")
     group.addoption(
@@ -277,12 +302,16 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "parallel(mpi=N, multiprocessing=M): run this test under MPI on N "
-        f"processes (default: {DEFAULT_NPROCS}; positional N or nprocs=N are "
-        "aliases; a list parametrizes over communicator sizes) and/or "
-        "declare that the test spawns M worker processes itself. "
-        "multiprocessing-only tests run in-process. The test's core cost "
-        "is max(N,1)*max(M,1), used by --max-concurrent-cores.")
+        "mpi(N): run this test under MPI on N processes (default: "
+        f"{DEFAULT_NPROCS}; nprocs=N is an alias; a list parametrizes over "
+        "communicator sizes).")
+    config.addinivalue_line(
+        "markers",
+        "multiprocessing(M): declare that this test spawns M worker "
+        "processes itself (e.g. multiprocessing.Pool); it runs in-process, "
+        "not under MPI. Combine with mpi(N) if each rank also spawns a "
+        "pool; the test's core cost is max(N,1)*max(M,1), used by "
+        "--max-concurrent-cores.")
 
     config.stash[_MPIRUN_KEY] = (config.getoption("--mpirun-exe")
                                  or shutil.which("mpirun")
@@ -364,28 +393,29 @@ def pytest_sessionstart(session):
 
 
 def pytest_generate_tests(metafunc):
-    """Split multi-valued parallel markers into one test per size.
+    """Split multi-valued mpi markers into one test per size.
 
-    ``@pytest.mark.parallel([2, 3])`` becomes ``test[nprocs=2]`` and
+    ``@pytest.mark.mpi([2, 3])`` becomes ``test[nprocs=2]`` and
     ``test[nprocs=3]``.  (Same behavior as mpi-pytest.)  This must run in
     both launcher and child mode so node IDs match between the two.
     """
     markers = tuple(m for m in getattr(metafunc.function, "pytestmark", ())
-                    if m.name == "parallel")
+                    if m.name == "mpi")
     if not markers:
         return
 
     marker, = markers
-    nprocss, _ = _parse_marker(marker)
+    nprocss = _parse_mpi_marker(marker)
     if len(nprocss) > 1:
         metafunc.fixturenames.append("_nprocs")
         metafunc.parametrize("_nprocs", nprocss, ids=lambda n: f"nprocs={n}")
 
 
 def pytest_collection_modifyitems(config, items):
-    """Attach parallel markers to testflo-style ``N_PROCS`` TestCase tests
-    so they are visible to ``-m parallel`` selection, stash every item's
-    ``ParallelSpec``, and mark MPI tests skipped when MPI cannot be used.
+    """Attach an ``mpi`` marker to testflo-style ``N_PROCS`` TestCase tests
+    so they are visible to ``-m mpi`` / ``-m 'not mpi'`` selection, stash
+    every item's ``ParallelSpec``, and mark MPI tests skipped when MPI
+    cannot be used.
 
     No special xdist grouping is done: every test, serial or parallel, is
     distributed freely and reserves its core cost from the shared budget
@@ -394,16 +424,16 @@ def pytest_collection_modifyitems(config, items):
     no_mpi = None
     if not _under_mpi() and not config.getoption("--nompi"):
         if not _have_mpi4py():
-            no_mpi = "mpi4py is required to run parallel tests (or use --nompi)"
+            no_mpi = "mpi4py is required to run mpi-marked tests (or use --nompi)"
         elif config.stash[_MPIRUN_KEY] is None:
             no_mpi = ("mpirun/mpiexec was not found in the system path "
                       "(or use --nompi)")
 
     for item in items:
-        if item.get_closest_marker("parallel") is None:
+        if item.get_closest_marker("mpi") is None:
             n = getattr(getattr(item, "cls", None), "N_PROCS", None)
             if n is not None and int(n) > 1:
-                item.add_marker(pytest.mark.parallel(nprocs=int(n)))
+                item.add_marker(pytest.mark.mpi(nprocs=int(n)))
         spec = _parallel_spec_for_item(item)
         item.stash[_SPEC_KEY] = spec
         if spec.mpi > 1 and no_mpi:
@@ -641,10 +671,21 @@ def pytest_runtest_protocol(item, nextitem):
     release, err = _acquire_cores(item, cores)
     if err is not None:
         reports = _failed_reports(item, err)
+        # This item's own setup/teardown never ran, so pytest's SetupState
+        # stack is still wherever the *previous* item's teardown left it
+        # (the ancestors shared with this item). Without collapsing it the
+        # rest of the way down to what nextitem needs, the next real item's
+        # own setup() trips "previous item was not torn down properly" the
+        # moment it lands in a different module/class.
+        item.session._setupstate.teardown_exact(nextitem)
     else:
         try:
             if launch:
                 reports = _run_mpi_item(item)
+                # Same reasoning: the MPI test's fixtures ran only inside
+                # the spawned mpirun, never through this session's
+                # SetupState, so it must be reconciled here too.
+                item.session._setupstate.teardown_exact(nextitem)
             else:
                 from _pytest.runner import runtestprotocol
                 runtestprotocol(item, nextitem=nextitem)  # logs its own

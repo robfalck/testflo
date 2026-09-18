@@ -53,7 +53,7 @@ def test_parallel_pass(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_ok(comm):
             assert comm.size == 2
             vals = comm.allgather(comm.rank)
@@ -72,7 +72,7 @@ def test_parallel_natural_assert_failure(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(nprocs=3)
+        @pytest.mark.mpi(3)
         def test_fail_on_rank_1(comm):
             if comm.rank == 1:
                 assert False, "boom on rank 1"
@@ -90,7 +90,7 @@ def test_parametrized_nprocs(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel([2, 3])
+        @pytest.mark.mpi([2, 3])
         def test_sizes(comm):
             assert comm.allreduce(1) == comm.size
         """
@@ -125,7 +125,7 @@ def test_xfail_propagates(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         @pytest.mark.xfail(reason="known bad")
         def test_xf(comm):
             assert False
@@ -141,7 +141,7 @@ def test_skip_propagates(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_skipped(comm):
             pytest.skip("not today")
         """
@@ -156,7 +156,7 @@ def test_captured_output_labeled_by_rank(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_output(comm):
             print(f"hello from rank {comm.rank}")
             if comm.rank == 0:
@@ -178,7 +178,7 @@ def test_mpi_timeout_breaks_deadlock(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_deadlock(comm):
             if comm.rank == 0:
                 comm.barrier()   # rank 1 never arrives
@@ -209,16 +209,16 @@ def test_xdist_mixed_suite(pytester):
         def test_serial():
             assert True
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_par_ok(comm):
             assert comm.allreduce(1) == 2
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_par_fail(comm):
             if comm.rank == 1:
                 assert False, "boom on rank 1"
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_par_skip(comm):
             pytest.skip("nope")
         """
@@ -227,6 +227,57 @@ def test_xdist_mixed_suite(pytester):
     result.assert_outcomes(passed=2, failed=1, skipped=1)
     result.stdout.fnmatch_lines(["*rank 1 of 2*"])
     result.stdout.fnmatch_lines(["*boom on rank 1*"])
+
+
+@mpi
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_setupstate_reconciled_after_mpi_launch(pytester):
+    """A test whose protocol is fully bypassed (here, an MPI launch) must
+    not leave stale collectors on pytest's own SetupState stack -- otherwise
+    the next item, if collected from a different module, trips pytest's own
+    "previous item was not torn down properly" assertion the moment it
+    lands on the same xdist worker right after the bypassed item."""
+    pytester.makepyfile(test_a="""
+        import pytest
+
+        def test_before():
+            pass
+
+        @pytest.mark.mpi(2)
+        def test_mid(comm):
+            assert comm.size == 2
+        """, test_b="""
+        def test_after():
+            pass
+        """)
+    result = pytester.runpytest_subprocess("-n", "1", "-v")
+    result.assert_outcomes(passed=3)
+    assert "not torn down properly" not in result.stdout.str()
+
+
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_setupstate_reconciled_after_core_budget_refusal(pytester):
+    """Same bug as above, triggered without needing real MPI: a test whose
+    core request can never fit the budget is failed without its protocol
+    ever running, and must reconcile the SetupState stack the same way."""
+    pytester.makepyfile(test_a="""
+        import pytest
+
+        def test_before():
+            pass
+
+        @pytest.mark.multiprocessing(4)
+        def test_mid(comm):
+            pass
+        """, test_b="""
+        def test_after():
+            pass
+        """)
+    result = pytester.runpytest_subprocess(
+        "-n", "1", "--max-concurrent-cores=1", "-v")
+    result.assert_outcomes(passed=2, failed=1)
+    result.stdout.fnmatch_lines(["*requires 4 cores*"])
+    assert "not torn down properly" not in result.stdout.str()
 
 
 @pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
@@ -242,7 +293,7 @@ def test_xdist_defaults_to_worksteal(pytester):
         def test_serial(i):
             pass
 
-        @pytest.mark.parallel(multiprocessing=2)
+        @pytest.mark.multiprocessing(2)
         def test_mp(comm):
             pass
         """
@@ -277,7 +328,7 @@ def test_waiting_multicore_test_is_not_starved(pytester):
             time.sleep(0.3)
             return x
 
-        @pytest.mark.parallel(multiprocessing=3)
+        @pytest.mark.multiprocessing(3)
         def test_pool(comm):
             t0 = time.time()
             with multiprocessing.Pool(3) as pool:
@@ -315,13 +366,13 @@ def test_concurrent_slots_budget(pytester):
         """
         import pytest, time
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_a(comm): time.sleep(0.5)
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_b(comm): time.sleep(0.5)
 
-        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.mpi(2)
         def test_c(comm): time.sleep(0.5)
         """
     )
@@ -336,7 +387,7 @@ def test_nompi_runs_in_process(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(nprocs=4)
+        @pytest.mark.mpi(4)
         def test_fake(comm):
             assert comm.size == 1
             assert comm.allgather(comm.rank) == [0]
@@ -357,44 +408,46 @@ def test_serial_untouched(pytester):
     result.assert_outcomes(passed=1)
 
 
-def _mark(*args, **kwargs):
-    return pytest.mark.parallel(*args, **kwargs).mark
-
-
 def test_parse_marker_forms():
-    from testflo.pytest_plugin import _parse_marker, _cores, DEFAULT_NPROCS
+    from testflo.pytest_plugin import (_parse_mpi_marker, _parse_mp_marker,
+                                       _cores, DEFAULT_NPROCS)
 
-    assert _parse_marker(_mark()) == ((DEFAULT_NPROCS,), 0)
-    assert _parse_marker(_mark(4)) == ((4,), 0)
-    assert _parse_marker(_mark(nprocs=4)) == ((4,), 0)
-    assert _parse_marker(_mark(mpi=4)) == ((4,), 0)
-    assert _parse_marker(_mark([2, 3])) == ((2, 3), 0)
-    assert _parse_marker(_mark(mpi=[2, 3])) == ((2, 3), 0)
-    assert _parse_marker(_mark(multiprocessing=4)) == ((0,), 4)
-    assert _parse_marker(_mark(mpi=0, multiprocessing=4)) == ((0,), 4)
-    assert _parse_marker(_mark(mpi=4, multiprocessing=2)) == ((4,), 2)
-    assert _parse_marker(_mark(4, multiprocessing=2)) == ((4,), 2)
+    def mpi_mark(*args, **kwargs):
+        return pytest.mark.mpi(*args, **kwargs).mark
+
+    def mp_mark(*args, **kwargs):
+        return pytest.mark.multiprocessing(*args, **kwargs).mark
+
+    assert _parse_mpi_marker(mpi_mark()) == (DEFAULT_NPROCS,)
+    assert _parse_mpi_marker(mpi_mark(4)) == (4,)
+    assert _parse_mpi_marker(mpi_mark(nprocs=4)) == (4,)
+    assert _parse_mpi_marker(mpi_mark([2, 3])) == (2, 3)
+    assert _parse_mpi_marker(mpi_mark(nprocs=[2, 3])) == (2, 3)
+
+    assert _parse_mp_marker(mp_mark(4)) == 4
 
     assert _cores(4, 0) == 4
     assert _cores(0, 4) == 4
     assert _cores(4, 2) == 8
     assert _cores(0, 0) == 1
 
-    for bad in (_mark(2, mpi=2), _mark(mpi=2, nprocs=2), _mark(2, 3),
-                _mark(bogus=2), _mark(multiprocessing=-1),
-                _mark(multiprocessing=[2, 3]), _mark(mpi="2")):
+    for bad in (mpi_mark(4, nprocs=4), mpi_mark(bogus=2), mpi_mark(mpi="2")):
         with pytest.raises(pytest.UsageError):
-            _parse_marker(bad)
+            _parse_mpi_marker(bad)
+
+    for bad in (mp_mark(), mp_mark(-1), mp_mark([2, 3]), mp_mark(bogus=2)):
+        with pytest.raises(pytest.UsageError):
+            _parse_mp_marker(bad)
 
 
 def test_multiprocessing_only_runs_in_process(pytester):
-    """parallel(multiprocessing=M) never spawns mpirun: the test runs in
-    this process on a FakeComm, but is still selectable with -m parallel."""
+    """multiprocessing(M) never spawns mpirun: the test runs in this process
+    on a FakeComm, but is still selectable with -m multiprocessing."""
     pytester.makepyfile(
         """
         import pytest
 
-        @pytest.mark.parallel(multiprocessing=4)
+        @pytest.mark.multiprocessing(4)
         def test_mp(comm):
             assert comm.size == 1
 
@@ -404,8 +457,48 @@ def test_multiprocessing_only_runs_in_process(pytester):
     )
     result = pytester.runpytest_subprocess("-v")
     result.assert_outcomes(passed=2)
-    result = pytester.runpytest_subprocess("-v", "-m", "parallel")
+    result = pytester.runpytest_subprocess("-v", "-m", "multiprocessing")
     result.assert_outcomes(passed=1, deselected=1)
+
+
+def test_bare_multiprocessing_marker_rejected(pytester):
+    """multiprocessing has no sensible default pool size, so a bare marker
+    (unlike a bare @pytest.mark.mpi) is a usage error, not DEFAULT_NPROCS."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.multiprocessing
+        def test_mp(comm):
+            pass
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    assert result.ret != 0
+    result.stderr.fnmatch_lines(["*Bad arguments given to multiprocessing marker*"])
+
+
+def test_deselect_mpi_keeps_multiprocessing(pytester):
+    """The motivating CI use case: `-m 'not mpi'` strips out every test that
+    would spawn mpirun while leaving multiprocessing-only tests runnable."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.mpi(2)
+        def test_needs_mpi(comm):
+            pass
+
+        @pytest.mark.multiprocessing(2)
+        def test_needs_pool(comm):
+            assert comm.size == 1
+
+        def test_plain():
+            pass
+        """
+    )
+    result = pytester.runpytest_subprocess("-v", "-m", "not mpi")
+    result.assert_outcomes(passed=2, deselected=1)
 
 
 def test_core_budget_over_limit_fails(pytester):
@@ -413,7 +506,7 @@ def test_core_budget_over_limit_fails(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(multiprocessing=4)
+        @pytest.mark.multiprocessing(4)
         def test_mp(comm):
             pass
         """
@@ -433,11 +526,11 @@ def test_default_budget_is_available_cores(pytester, monkeypatch):
         f"""
         import pytest
 
-        @pytest.mark.parallel(multiprocessing={too_many})
+        @pytest.mark.multiprocessing({too_many})
         def test_big(comm):
             pass
 
-        @pytest.mark.parallel(multiprocessing=1)
+        @pytest.mark.multiprocessing(1)
         def test_small(comm):
             pass
         """
@@ -460,12 +553,12 @@ def test_default_budget_is_available_cores(pytester, monkeypatch):
 
 
 @mpi
-def test_mpi_kwarg_alias(pytester):
+def test_mpi_nprocs_kwarg_alias(pytester):
     pytester.makepyfile(
         """
         import pytest
 
-        @pytest.mark.parallel(mpi=2)
+        @pytest.mark.mpi(nprocs=2)
         def test_ok(comm):
             assert comm.size == 2
         """
@@ -480,7 +573,8 @@ def test_mpi_times_multiprocessing_charges_product(pytester):
         """
         import pytest
 
-        @pytest.mark.parallel(mpi=2, multiprocessing=2)
+        @pytest.mark.mpi(2)
+        @pytest.mark.multiprocessing(2)
         def test_both(comm):
             assert comm.size == 2
         """
@@ -507,7 +601,7 @@ def test_multiprocessing_pool_in_marked_test(pytester):
         def square(x):
             return x * x
 
-        @pytest.mark.parallel(multiprocessing=3)
+        @pytest.mark.multiprocessing(3)
         def test_pool(comm):
             assert comm.size == 1
             with multiprocessing.Pool(3) as pool:
@@ -546,13 +640,13 @@ def test_core_budget_serializes_pools(pytester):
             with open(os.path.join(LOGDIR, name), "w") as f:
                 f.write(f"{name} {t0} {t1}")
 
-        @pytest.mark.parallel(multiprocessing=2)
+        @pytest.mark.multiprocessing(2)
         def test_a(comm): _run("a")
 
-        @pytest.mark.parallel(multiprocessing=2)
+        @pytest.mark.multiprocessing(2)
         def test_b(comm): _run("b")
 
-        @pytest.mark.parallel(multiprocessing=2)
+        @pytest.mark.multiprocessing(2)
         def test_c(comm): _run("c")
         """
     )
@@ -595,7 +689,7 @@ def test_serial_tests_count_against_budget(pytester):
         def test_serial(i):
             t0 = time.time(); time.sleep(0.4); _log(f"serial{i}", t0, time.time())
 
-        @pytest.mark.parallel(multiprocessing=2)
+        @pytest.mark.multiprocessing(2)
         def test_pool(comm):
             t0 = time.time()
             with multiprocessing.Pool(2) as pool:
@@ -635,7 +729,8 @@ def test_combo_under_nompi_charges_only_multiprocessing(pytester):
         def double(x):
             return 2 * x
 
-        @pytest.mark.parallel(mpi=4, multiprocessing=2)
+        @pytest.mark.mpi(4)
+        @pytest.mark.multiprocessing(2)
         def test_combo(comm):
             assert comm.size == 1
             with multiprocessing.Pool(2) as pool:
@@ -663,7 +758,8 @@ def test_mpi_ranks_each_use_a_pool(pytester):
         def square(x):
             return x * x
 
-        @pytest.mark.parallel(mpi=2, multiprocessing=2)
+        @pytest.mark.mpi(2)
+        @pytest.mark.multiprocessing(2)
         def test_pool_per_rank(comm):
             assert comm.size == 2
             # each rank squares a different slice
@@ -690,7 +786,8 @@ def test_mpi_sizes_parametrized_with_pool(pytester):
         def inc(x):
             return x + 1
 
-        @pytest.mark.parallel(mpi=[2, 3], multiprocessing=2)
+        @pytest.mark.mpi([2, 3])
+        @pytest.mark.multiprocessing(2)
         def test_sizes(comm):
             with multiprocessing.Pool(2) as pool:
                 got = pool.map(inc, [comm.rank] * 2)

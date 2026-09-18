@@ -186,20 +186,27 @@ testflo ships a pytest plugin that brings testflo's MPI execution model to pytes
 
 ### Marking tests as parallel
 
+`mpi` and `multiprocessing` are independent markers that compose freely on
+the same test — select one without the other with pytest's `-m`, e.g.
+`pytest -m 'not mpi'` to skip everything that spawns `mpirun` while still
+running multiprocessing-only tests. This is the main reason for two markers
+instead of one: it lets a fast local/CI pass exercise multiprocessing
+scaling without the overhead or hang risk of MPI.
+
 ```python
 import pytest
 
-@pytest.mark.parallel(4)
+@pytest.mark.mpi(4)
 def test_foo(comm):
     assert comm.size == 4
 ```
 
-`@pytest.mark.parallel(N)` is the canonical form; `mpi=N` and the older
-`nprocs=N` are equivalent keyword forms.  To parametrize over multiple
-sizes, pass a list:
+`@pytest.mark.mpi(N)` is the canonical form; `nprocs=N` is an equivalent
+keyword form. A bare `@pytest.mark.mpi` defaults to `DEFAULT_NPROCS` (2).
+To parametrize over multiple sizes, pass a list:
 
 ```python
-@pytest.mark.parallel([2, 4])
+@pytest.mark.mpi([2, 4])
 def test_bar(comm):
     assert comm.allreduce(1) == comm.size
 ```
@@ -207,30 +214,33 @@ def test_bar(comm):
 ### Multiprocessing tests and core accounting
 
 Not every parallel test needs MPI.  A test that spins up its own pool of
-worker processes (e.g. `multiprocessing.Pool(4)`) can declare that with the
-`multiprocessing` keyword.  No `mpirun` is spawned — the test runs in-process
-with a size-1 `FakeComm` — but the plugin now knows how many cores it will
-use:
+worker processes (e.g. `multiprocessing.Pool(4)`) can declare that with
+`@pytest.mark.multiprocessing(M)`.  No `mpirun` is spawned — the test runs
+in-process with a size-1 `FakeComm` — but the plugin now knows how many
+cores it will use.  Unlike `mpi`, there is no sensible default pool size,
+so the marker requires an explicit argument — a bare
+`@pytest.mark.multiprocessing` is a usage error:
 
 ```python
-@pytest.mark.parallel(multiprocessing=4)
+@pytest.mark.multiprocessing(4)
 def test_pool():
     with multiprocessing.Pool(4) as pool:
         ...
 ```
 
-The two can be combined when each MPI rank fans out further.  A test's core
-cost is `max(mpi, 1) * max(multiprocessing, 1)`:
+The two markers can be stacked on the same test when each MPI rank fans out
+further.  A test's core cost is `max(mpi, 1) * max(multiprocessing, 1)`:
 
-| Marker | mpirun ranks | cores |
+| Markers | mpirun ranks | cores |
 |--------|--------------|-------|
-| `parallel(4)` / `parallel(mpi=4)` | 4 | 4 |
-| `parallel(multiprocessing=4)` | none | 4 |
-| `parallel(mpi=4, multiprocessing=2)` | 4 | 8 |
+| `mpi(4)` | 4 | 4 |
+| `multiprocessing(4)` | none | 4 |
+| `mpi(4)` + `multiprocessing(2)` | 4 | 8 |
 
-Both kinds are selected by `-m parallel`, and both count against the core
-budget (below).  The existing `N_PROCS` class attribute is
-equivalent to `mpi=N_PROCS`.
+Both kinds count against the core budget (below).  `-m mpi`, `-m
+multiprocessing`, and `-m "mpi or multiprocessing"` select tests carrying
+each marker respectively.  The existing `N_PROCS` class attribute is
+equivalent to `mpi(nprocs=N_PROCS)` and is selected by `-m mpi` too.
 
 Existing testflo-style `unittest.TestCase` classes with an `N_PROCS` attribute
 work unchanged:
@@ -292,7 +302,7 @@ sequenceDiagram
     end
 
     rect rgb(235, 235, 250)
-        note over W2,R: parallel(mpi=4): needs 4 cores
+        note over W2,R: mpi(4): needs 4 cores
         W2->>M: acquire(pid, 4)
         note over M: budget full: request queued (FIFO),<br/>call blocks in the manager - no polling
         W1->>M: acquire(pid, 1)
@@ -358,7 +368,7 @@ The spawned mpirun is killed after the timeout and the test is reported failed.
 
 ### Running without MPI
 
-`--nompi` runs parallel-marked tests in-process on a `FakeComm` of size 1,
+`--nompi` runs mpi-marked tests in-process on a `FakeComm` of size 1,
 identical to `testflo --nompi`.  Useful for quick iteration or environments
 without MPI installed:
 
