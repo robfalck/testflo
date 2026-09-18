@@ -1,0 +1,855 @@
+"""Tests for testflo-pytest itself.
+
+These use pytest's ``pytester`` fixture to run the plugin end-to-end,
+including real mpirun spawning where MPI is available.
+"""
+
+import platform
+import shutil
+import subprocess
+
+import pytest
+
+pytest_plugins = ["pytester"]
+
+HAVE_MPI = (shutil.which("mpirun") or shutil.which("mpiexec")) is not None
+try:
+    import mpi4py  # noqa: F401
+except ImportError:
+    HAVE_MPI = False
+
+mpi = pytest.mark.skipif(not HAVE_MPI, reason="requires mpi4py and mpirun")
+
+
+def _is_mpich_on_macos():
+    """Check if running MPICH on macOS."""
+    if platform.system() != "Darwin":
+        return False
+    try:
+        output = subprocess.check_output(["mpirun", "--version"], stderr=subprocess.STDOUT, text=True)
+        return "HYDRA" in output
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+skip_mpich_macos = pytest.mark.skipif(
+    _is_mpich_on_macos(),
+    reason="MPICH on macOS has OFI finalization issues with forced process termination"
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_default_core_budget(monkeypatch):
+    """Lift the default core budget for the plugin's own tests so they don't
+    depend on how many cores the CI runner has.  Tests that exercise the
+    budget pass an explicit --max-concurrent-cores, which takes precedence;
+    the test of the default itself removes this again.
+
+    Also drop the xdist run id this test module's own workers export:
+    otherwise the pytester subprocesses would share *this* run's core
+    budget file and deadlock against the workers running them."""
+    monkeypatch.setenv("TESTFLO_PYTEST_OVERSUBSCRIBE", "1")
+    monkeypatch.delenv("PYTEST_XDIST_TESTRUNUID", raising=False)
+
+
+@mpi
+def test_parallel_pass(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_ok(comm):
+            assert comm.size == 2
+            vals = comm.allgather(comm.rank)
+            assert vals == [0, 1]
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=1)
+
+
+@mpi
+def test_parallel_natural_assert_failure(pytester):
+    """A plain assert failing on a single rank fails the whole test and
+    the per-rank traceback is reported -- the core testflo behavior."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(nprocs=3)
+        def test_fail_on_rank_1(comm):
+            if comm.rank == 1:
+                assert False, "boom on rank 1"
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*rank 1 of 3*"])
+    result.stdout.fnmatch_lines(["*boom on rank 1*"])
+
+
+@mpi
+def test_parametrized_nprocs(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel([2, 3])
+        def test_sizes(comm):
+            assert comm.allreduce(1) == comm.size
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=2)
+    result.stdout.fnmatch_lines(["*nprocs=2*", "*nprocs=3*"])
+
+
+@mpi
+def test_n_procs_class_attribute(pytester):
+    """testflo-style N_PROCS on a unittest.TestCase triggers MPI spawning."""
+    pytester.makepyfile(
+        """
+        import unittest
+
+        class TestMPI(unittest.TestCase):
+            N_PROCS = 2
+
+            def test_size(self):
+                from mpi4py import MPI
+                self.assertEqual(MPI.COMM_WORLD.size, 2)
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=1)
+
+
+@mpi
+def test_xfail_propagates(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(nprocs=2)
+        @pytest.mark.xfail(reason="known bad")
+        def test_xf(comm):
+            assert False
+        """
+    )
+    result = pytester.runpytest_subprocess("-ra")
+    result.assert_outcomes(xfailed=1)
+
+
+@mpi
+def test_skip_propagates(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_skipped(comm):
+            pytest.skip("not today")
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(skipped=1)
+
+
+@mpi
+def test_captured_output_labeled_by_rank(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_output(comm):
+            print(f"hello from rank {comm.rank}")
+            if comm.rank == 0:
+                raise RuntimeError("fail so output is shown")
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*rank 0: Captured stdout call*"])
+    result.stdout.fnmatch_lines(["*hello from rank 0*"])
+
+
+@mpi
+@skip_mpich_macos
+def test_mpi_timeout_breaks_deadlock(pytester):
+    """A desynchronized collective (the known caveat of the natural-assert
+    model) is broken by --mpi-timeout instead of hanging forever."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_deadlock(comm):
+            if comm.rank == 0:
+                comm.barrier()   # rank 1 never arrives
+        """
+    )
+    result = pytester.runpytest_subprocess("--mpi-timeout=5", "-v")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*timed out*"])
+
+
+try:
+    import xdist  # noqa: F401
+    HAVE_XDIST = True
+except ImportError:
+    HAVE_XDIST = False
+
+
+@mpi
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_xdist_mixed_suite(pytester):
+    """Serial and parallel tests both work when distributed by xdist:
+    each worker spawns its own mpirun, and synthesized per-rank reports
+    survive execnet serialization back to the controller."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        def test_serial():
+            assert True
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_par_ok(comm):
+            assert comm.allreduce(1) == 2
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_par_fail(comm):
+            if comm.rank == 1:
+                assert False, "boom on rank 1"
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_par_skip(comm):
+            pytest.skip("nope")
+        """
+    )
+    result = pytester.runpytest_subprocess("-n", "2", "-v")
+    result.assert_outcomes(passed=2, failed=1, skipped=1)
+    result.stdout.fnmatch_lines(["*rank 1 of 2*"])
+    result.stdout.fnmatch_lines(["*boom on rank 1*"])
+
+
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_xdist_defaults_to_worksteal(pytester):
+    """No xdist grouping is imposed any more; work stealing is the default
+    distribution so a worker waiting for cores doesn't block the tests
+    queued behind it.  An explicit --dist is left alone."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parametrize("i", range(4))
+        def test_serial(i):
+            pass
+
+        @pytest.mark.parallel(multiprocessing=2)
+        def test_mp(comm):
+            pass
+        """
+    )
+    result = pytester.runpytest_subprocess("-n", "2", "-v")
+    result.assert_outcomes(passed=5)
+    result.stdout.fnmatch_lines(["*WorkStealingScheduling*"])
+    result = pytester.runpytest_subprocess("-n", "2", "--dist", "load", "-v")
+    result.assert_outcomes(passed=5)
+    result.stdout.fnmatch_lines(["*LoadScheduling*"])
+
+
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_waiting_multicore_test_is_not_starved(pytester, monkeypatch):
+    """A 3-core test on a 3-core budget with 3 workers churning serial tests
+    must get its turn as soon as the running serial tests finish, not after
+    the whole serial queue drains: once it is waiting, no new serial test
+    may start ahead of it."""
+    monkeypatch.setenv("TMPDIR", str(pytester.path))
+    monkeypatch.setenv("TMP", str(pytester.path))
+    monkeypatch.setenv("TEMP", str(pytester.path))
+    pytester.makepyfile(
+        """
+        import multiprocessing, os, time
+        import pytest
+
+        LOG = os.path.join(os.path.dirname(__file__), "intervals.txt")
+
+        def _log(name, t0, t1):
+            with open(LOG, "a") as f:
+                f.write(f"{name} {t0} {t1}\\n")
+
+        def burn(x):
+            time.sleep(0.3)
+            return x
+
+        @pytest.mark.parallel(multiprocessing=3)
+        def test_pool(comm):
+            t0 = time.time()
+            with multiprocessing.Pool(3) as pool:
+                pool.map(burn, [1, 2, 3])
+            _log("pool", t0, time.time())
+
+        @pytest.mark.parametrize("i", range(12))
+        def test_serial(i):
+            t0 = time.time(); time.sleep(0.2); _log(f"serial{i}", t0, time.time())
+        """
+    )
+    result = pytester.runpytest_subprocess("-n", "3",
+                                           "--max-concurrent-cores=3", "-v")
+    result.assert_outcomes(passed=13)
+    intervals = {}
+    with open(pytester.path / "intervals.txt") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            name, t0, t1 = line.split()
+            intervals[name] = (float(t0), float(t1))
+    p0, p1 = intervals.pop("pool")
+    # nothing overlaps the 3-core test ...
+    for name, (s0, s1) in intervals.items():
+        assert s1 <= p0 or s0 >= p1, f"{name} overlapped the pool test"
+    # ... and it ran early: at most the serial tests already in flight when
+    # it started waiting (one per other worker, plus a little race slack)
+    # finished before it, the rest were deferred behind it
+    before = sum(1 for s0, _ in intervals.values() if s0 < p0)
+    assert before <= 4, f"{before} serial tests ran ahead of the pool test"
+
+
+@mpi
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_concurrent_slots_budget(pytester, monkeypatch):
+    """--mpi-concurrent-slots bounds total in-flight ranks across workers;
+    the limiter's high-water mark proves the budget was respected."""
+    monkeypatch.setenv("TMPDIR", str(pytester.path))
+    pytester.makepyfile(
+        """
+        import pytest, time
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_a(comm): time.sleep(0.5)
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_b(comm): time.sleep(0.5)
+
+        @pytest.mark.parallel(nprocs=2)
+        def test_c(comm): time.sleep(0.5)
+        """
+    )
+    result = pytester.runpytest_subprocess("-n", "3",
+                                           "--mpi-concurrent-slots=2", "-v")
+    result.assert_outcomes(passed=3)
+    import glob, json
+    slot_files = glob.glob(str(pytester.path / "testflo_pytest_*.slots"))
+    assert slot_files, "slot state file not found"
+    state = json.load(open(slot_files[0]))
+    assert state["hwm"] <= 2, f"budget exceeded: hwm={state['hwm']}"
+    assert not state["holders"], "slots leaked"
+
+
+def test_nompi_runs_in_process(pytester):
+    """--nompi runs parallel tests on a FakeComm of size 1, like testflo."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(nprocs=4)
+        def test_fake(comm):
+            assert comm.size == 1
+            assert comm.allgather(comm.rank) == [0]
+        """
+    )
+    result = pytester.runpytest_subprocess("--nompi", "-v")
+    result.assert_outcomes(passed=1)
+
+
+def test_serial_untouched(pytester):
+    pytester.makepyfile(
+        """
+        def test_plain():
+            assert True
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=1)
+
+
+def _mark(*args, **kwargs):
+    return pytest.mark.parallel(*args, **kwargs).mark
+
+
+def test_parse_marker_forms():
+    from testflo.pytest_plugin import _parse_marker, _cores, DEFAULT_NPROCS
+
+    assert _parse_marker(_mark()) == ((DEFAULT_NPROCS,), 0)
+    assert _parse_marker(_mark(4)) == ((4,), 0)
+    assert _parse_marker(_mark(nprocs=4)) == ((4,), 0)
+    assert _parse_marker(_mark(mpi=4)) == ((4,), 0)
+    assert _parse_marker(_mark([2, 3])) == ((2, 3), 0)
+    assert _parse_marker(_mark(mpi=[2, 3])) == ((2, 3), 0)
+    assert _parse_marker(_mark(multiprocessing=4)) == ((0,), 4)
+    assert _parse_marker(_mark(mpi=0, multiprocessing=4)) == ((0,), 4)
+    assert _parse_marker(_mark(mpi=4, multiprocessing=2)) == ((4,), 2)
+    assert _parse_marker(_mark(4, multiprocessing=2)) == ((4,), 2)
+
+    assert _cores(4, 0) == 4
+    assert _cores(0, 4) == 4
+    assert _cores(4, 2) == 8
+    assert _cores(0, 0) == 1
+
+    for bad in (_mark(2, mpi=2), _mark(mpi=2, nprocs=2), _mark(2, 3),
+                _mark(bogus=2), _mark(multiprocessing=-1),
+                _mark(multiprocessing=[2, 3]), _mark(mpi="2")):
+        with pytest.raises(pytest.UsageError):
+            _parse_marker(bad)
+
+
+def test_multiprocessing_only_runs_in_process(pytester):
+    """parallel(multiprocessing=M) never spawns mpirun: the test runs in
+    this process on a FakeComm, but is still selectable with -m parallel."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(multiprocessing=4)
+        def test_mp(comm):
+            assert comm.size == 1
+
+        def test_serial():
+            pass
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=2)
+    result = pytester.runpytest_subprocess("-v", "-m", "parallel")
+    result.assert_outcomes(passed=1, deselected=1)
+
+
+def test_core_budget_over_limit_fails(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(multiprocessing=4)
+        def test_mp(comm):
+            pass
+        """
+    )
+    result = pytester.runpytest_subprocess("--max-concurrent-cores=2", "-v")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*requires 4 cores*"])
+
+
+def test_default_budget_is_available_cores(pytester, monkeypatch):
+    """With no flags, a test needing more cores than the machine has is
+    refused; --oversubscribe (or the env var) lets it run anyway."""
+    from testflo.pytest_plugin import _available_cores
+    monkeypatch.delenv("TESTFLO_PYTEST_OVERSUBSCRIBE")
+    too_many = _available_cores() + 1
+    pytester.makepyfile(
+        f"""
+        import pytest
+
+        @pytest.mark.parallel(multiprocessing={too_many})
+        def test_big(comm):
+            pass
+
+        @pytest.mark.parallel(multiprocessing=1)
+        def test_small(comm):
+            pass
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=1, failed=1)
+    result.stdout.fnmatch_lines([f"*requires {too_many} cores*"])
+
+    result = pytester.runpytest_subprocess("--oversubscribe", "-v")
+    result.assert_outcomes(passed=2)
+
+    monkeypatch.setenv("TESTFLO_PYTEST_OVERSUBSCRIBE", "1")
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=2)
+
+    # an explicit budget beats --oversubscribe
+    result = pytester.runpytest_subprocess("--oversubscribe",
+                                           "--max-concurrent-cores=1", "-v")
+    result.assert_outcomes(passed=1, failed=1)
+
+
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_core_budget_multiprocessing(pytester, monkeypatch):
+    """--max-concurrent-cores throttles in-process multiprocessing tests
+    across xdist workers, and the reservation is released afterwards."""
+    monkeypatch.setenv("TMPDIR", str(pytester.path))
+    monkeypatch.setenv("TMP", str(pytester.path))
+    monkeypatch.setenv("TEMP", str(pytester.path))
+    pytester.makepyfile(
+        """
+        import pytest, time
+
+        @pytest.mark.parallel(multiprocessing=2)
+        def test_a(comm): time.sleep(0.5)
+
+        @pytest.mark.parallel(multiprocessing=2)
+        def test_b(comm): time.sleep(0.5)
+
+        @pytest.mark.parallel(multiprocessing=2)
+        def test_c(comm): time.sleep(0.5)
+        """
+    )
+    result = pytester.runpytest_subprocess("-n", "3", "--dist", "load",
+                                           "--max-concurrent-cores=2", "-v")
+    result.assert_outcomes(passed=3)
+    import glob, json
+    slot_files = glob.glob(str(pytester.path / "testflo_pytest_*.slots"))
+    assert slot_files, "slot state file not found"
+    state = json.load(open(slot_files[0]))
+    assert state["hwm"] <= 2, f"budget exceeded: hwm={state['hwm']}"
+    assert not state["holders"], "cores leaked"
+
+
+@mpi
+def test_mpi_kwarg_alias(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(mpi=2)
+        def test_ok(comm):
+            assert comm.size == 2
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=1)
+
+
+@mpi
+def test_mpi_times_multiprocessing_charges_product(pytester):
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.parallel(mpi=2, multiprocessing=2)
+        def test_both(comm):
+            assert comm.size == 2
+        """
+    )
+    result = pytester.runpytest_subprocess("--max-concurrent-cores=3", "-v")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*requires 4 cores*"])
+    result = pytester.runpytest_subprocess("--max-concurrent-cores=4", "-v")
+    result.assert_outcomes(passed=1)
+
+
+# ---------------------------------------------------------------------------
+# tests that really use multiprocessing (and MPI + multiprocessing together)
+# ---------------------------------------------------------------------------
+
+def test_multiprocessing_pool_in_marked_test(pytester):
+    """A multiprocessing-only parallel test can actually spin up a Pool and
+    do work in it; no MPI machinery is involved."""
+    pytester.makepyfile(
+        """
+        import multiprocessing
+        import pytest
+
+        def square(x):
+            return x * x
+
+        @pytest.mark.parallel(multiprocessing=3)
+        def test_pool(comm):
+            assert comm.size == 1
+            with multiprocessing.Pool(3) as pool:
+                got = pool.map(square, range(10))
+            assert got == [x * x for x in range(10)]
+        """
+    )
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=1)
+
+
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_core_budget_serializes_pools(pytester, monkeypatch):
+    """Two Pool-using tests that each cost the whole budget must not run at
+    the same time, even though xdist hands them to different workers.
+
+    Each test logs its wall-clock interval; the intervals must not overlap.
+    """
+    monkeypatch.setenv("TMPDIR", str(pytester.path))
+    monkeypatch.setenv("TMP", str(pytester.path))
+    monkeypatch.setenv("TEMP", str(pytester.path))
+    pytester.makepyfile(
+        """
+        import multiprocessing, os, time
+        import pytest
+
+        LOG = os.path.join(os.path.dirname(__file__), "intervals.txt")
+
+        def burn(x):
+            time.sleep(0.3)
+            return x
+
+        def _run(name):
+            t0 = time.time()
+            with multiprocessing.Pool(2) as pool:
+                assert pool.map(burn, [1, 2]) == [1, 2]
+            t1 = time.time()
+            with open(LOG, "a") as f:
+                f.write(f"{name} {t0} {t1}\\n")
+
+        @pytest.mark.parallel(multiprocessing=2)
+        def test_a(comm): _run("a")
+
+        @pytest.mark.parallel(multiprocessing=2)
+        def test_b(comm): _run("b")
+
+        @pytest.mark.parallel(multiprocessing=2)
+        def test_c(comm): _run("c")
+        """
+    )
+    # --dist load so xdist really does try to run them concurrently
+    result = pytester.runpytest_subprocess("-n", "3", "--dist", "load",
+                                           "--max-concurrent-cores=2", "-v")
+    result.assert_outcomes(passed=3)
+    intervals = []
+    with open(pytester.path / "intervals.txt") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            name, t0, t1 = line.split()
+            intervals.append((float(t0), float(t1), name))
+    assert len(intervals) == 3
+    intervals.sort()
+    for (_, end, a), (start, _, b) in zip(intervals, intervals[1:]):
+        assert start >= end, f"{a} and {b} overlapped despite budget of 2"
+
+
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_serial_tests_count_against_budget(pytester, monkeypatch):
+    """Serial tests cost one core each.  With a budget of 2, a 2-core pool
+    test may not overlap with any serial test running on another worker,
+    while the serial tests may overlap each other (1 + 1 <= 2)."""
+    monkeypatch.setenv("TMPDIR", str(pytester.path))
+    monkeypatch.setenv("TMP", str(pytester.path))
+    monkeypatch.setenv("TEMP", str(pytester.path))
+    pytester.makepyfile(
+        """
+        import multiprocessing, os, time
+        import pytest
+
+        LOG = os.path.join(os.path.dirname(__file__), "intervals.txt")
+
+        def _log(name, t0, t1):
+            with open(LOG, "a") as f:
+                f.write(f"{name} {t0} {t1}\\n")
+
+        def burn(x):
+            time.sleep(0.4)
+            return x
+
+        @pytest.mark.parametrize("i", range(4))
+        def test_serial(i):
+            t0 = time.time(); time.sleep(0.4); _log(f"serial{i}", t0, time.time())
+
+        @pytest.mark.parallel(multiprocessing=2)
+        def test_pool(comm):
+            t0 = time.time()
+            with multiprocessing.Pool(2) as pool:
+                pool.map(burn, [1, 2])
+            _log("pool", t0, time.time())
+        """
+    )
+    result = pytester.runpytest_subprocess("-n", "3", "--dist", "load",
+                                           "--max-concurrent-cores=2", "-v")
+    result.assert_outcomes(passed=5)
+    intervals = {}
+    with open(pytester.path / "intervals.txt") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            name, t0, t1 = line.split()
+            intervals[name] = (float(t0), float(t1))
+    assert len(intervals) == 5
+    p0, p1 = intervals.pop("pool")
+    for name, (s0, s1) in intervals.items():
+        assert s1 <= p0 or s0 >= p1, f"{name} overlapped the 2-core pool test"
+    # and at most two serial tests at once (the budget, not the 3 workers)
+    events = sorted([(s0, 1) for s0, _ in intervals.values()]
+                    + [(s1, -1) for _, s1 in intervals.values()])
+    running = peak = 0
+    for _, d in events:
+        running += d
+        peak = max(peak, running)
+    assert peak <= 2
+
+
+def test_combo_under_nompi_charges_only_multiprocessing(pytester):
+    """parallel(mpi=4, multiprocessing=2) costs 8 cores normally, but under
+    --nompi no ranks are spawned so only the pool's 2 cores are charged."""
+    pytester.makepyfile(
+        """
+        import multiprocessing
+        import pytest
+
+        def double(x):
+            return 2 * x
+
+        @pytest.mark.parallel(mpi=4, multiprocessing=2)
+        def test_combo(comm):
+            assert comm.size == 1
+            with multiprocessing.Pool(2) as pool:
+                assert pool.map(double, [1, 2, 3]) == [2, 4, 6]
+        """
+    )
+    result = pytester.runpytest_subprocess("--nompi",
+                                           "--max-concurrent-cores=2", "-v")
+    result.assert_outcomes(passed=1)
+    result = pytester.runpytest_subprocess("--nompi",
+                                           "--max-concurrent-cores=1", "-v")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*requires 2 cores*"])
+
+
+@mpi
+def test_mpi_ranks_each_use_a_pool(pytester):
+    """parallel(mpi=2, multiprocessing=2): every MPI rank runs its own Pool
+    and the per-rank results are combined collectively."""
+    pytester.makepyfile(
+        """
+        import multiprocessing
+        import pytest
+
+        def square(x):
+            return x * x
+
+        @pytest.mark.parallel(mpi=2, multiprocessing=2)
+        def test_pool_per_rank(comm):
+            assert comm.size == 2
+            # each rank squares a different slice
+            mine = list(range(comm.rank * 5, (comm.rank + 1) * 5))
+            with multiprocessing.Pool(2) as pool:
+                local = pool.map(square, mine)
+            everything = sum(comm.allgather(local), [])
+            assert everything == [x * x for x in range(10)]
+        """
+    )
+    result = pytester.runpytest_subprocess("--max-concurrent-cores=4", "-v")
+    result.assert_outcomes(passed=1)
+
+
+@mpi
+def test_mpi_sizes_parametrized_with_pool(pytester):
+    """A list of MPI sizes still parametrizes when multiprocessing is also
+    given; each size runs with its pool and costs size*2 cores."""
+    pytester.makepyfile(
+        """
+        import multiprocessing
+        import pytest
+
+        def inc(x):
+            return x + 1
+
+        @pytest.mark.parallel(mpi=[2, 3], multiprocessing=2)
+        def test_sizes(comm):
+            with multiprocessing.Pool(2) as pool:
+                got = pool.map(inc, [comm.rank] * 2)
+            assert got == [comm.rank + 1] * 2
+            assert comm.allreduce(1) == comm.size
+        """
+    )
+    result = pytester.runpytest_subprocess("--max-concurrent-cores=6", "-v")
+    result.assert_outcomes(passed=2)
+    result.stdout.fnmatch_lines(["*nprocs=2*", "*nprocs=3*"])
+    # budget of 5 fits the 2-rank case (4 cores) but not the 3-rank (6)
+    result = pytester.runpytest_subprocess("--max-concurrent-cores=5", "-v")
+    result.assert_outcomes(passed=1, failed=1)
+    result.stdout.fnmatch_lines(["*requires 6 cores*"])
+
+
+def test_rank_report_aggregation(pytester):
+    """The launcher reduces the raw per-phase reports each rank ships to
+    one outcome per rank, then one call report per test.  Exercised with
+    real pytest reports so it does not need MPI."""
+    import json
+    from testflo.pytest_plugin import (_serialize_report,
+                                       _aggregate_rank_results)
+    pytester.makepyfile(
+        """
+        import pytest
+
+        def test_pass(): print("out"); assert True
+        def test_fail(): assert 0, "boom"
+        def test_skip(): pytest.skip("nope")
+        @pytest.mark.xfail(reason="known")
+        def test_xfail(): assert 0
+        """
+    )
+    reprec = pytester.inline_run("-p", "no:cacheprovider", "--oversubscribe")
+    by_node = {}
+    for rep in reprec.getreports("pytest_runtest_logreport"):
+        by_node.setdefault(rep.nodeid, []).append(_serialize_report(rep))
+    items = {i.name: i for i in pytester.getitems(
+        pytester.path.joinpath("test_rank_report_aggregation.py").read_text())}
+
+    def agg(name, ranks):
+        nodeid, = (n for n in by_node if n.endswith("::" + name))
+        data = {"nprocs": len(ranks),
+                "ranks": [{"rank": r, "results": {nodeid: by_node[nodeid]}}
+                          for r in ranks]}
+        # the real path goes through the JSON results file
+        return _aggregate_rank_results(items[name],
+                                       json.loads(json.dumps(data)))
+
+    rep = agg("test_pass", [0, 1])
+    assert rep.outcome == "passed"
+    assert ("rank 1: Captured stdout call", "out\n") in rep.sections
+
+    rep = agg("test_fail", [0, 1, 2])
+    assert rep.outcome == "failed"
+    assert "rank 0 of 3" in rep.longrepr and "boom" in rep.longrepr
+
+    rep = agg("test_skip", [0])
+    assert rep.outcome == "skipped"
+    assert rep.longrepr[2] == "Skipped: nope"   # (path, lineno, reason) form
+
+    rep = agg("test_xfail", [0, 1])
+    assert rep.outcome == "skipped" and rep.wasxfail == "known"
+
+    # a rank that failed plus one that passed -> failed, passing rank noted
+    nodeid_f, = (n for n in by_node if n.endswith("::test_fail"))
+    nodeid_p, = (n for n in by_node if n.endswith("::test_pass"))
+    data = {"nprocs": 2, "ranks": [
+        {"rank": 0, "results": {nodeid_f: by_node[nodeid_f]}},
+        {"rank": 1, "results": {nodeid_f: by_node[nodeid_p]}}]}
+    rep = _aggregate_rank_results(items["test_fail"], data)
+    assert rep.outcome == "failed" and "(ranks [1] passed)" in rep.longrepr
+
+
+def test_slot_limiter_prunes_dead_holders(tmp_path, monkeypatch):
+    """Cores held by a worker that died are reclaimed on the next acquire,
+    so a crashed worker cannot permanently starve the budget."""
+    import os, sys, json, tempfile
+    from testflo.pytest_plugin import _SlotLimiter
+
+    # gettempdir() caches its answer, so patch the cache rather than env
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("PYTEST_XDIST_TESTRUNUID", "deadtest")
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    # keep `proc` (and so its Windows process handle) alive: the pruner
+    # must recognise an exited process even while a handle to it is open
+    dead_pid = proc.pid
+
+    limiter = _SlotLimiter(4)
+    with open(limiter.state_path, "w") as f:
+        json.dump({"holders": {str(dead_pid): 4}, "hwm": 4}, f)
+
+    limiter.acquire(2, timeout=5)   # would hang/timeout without pruning
+    state = json.load(open(limiter.state_path))
+    assert str(dead_pid) not in state["holders"]
+    assert state["holders"] == {str(os.getpid()): 2}
+    limiter.release()
+    state = json.load(open(limiter.state_path))
+    assert not state["holders"]
