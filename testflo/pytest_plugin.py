@@ -57,8 +57,11 @@ import shutil
 import numbers
 import subprocess
 import functools
+import threading
 import collections
 import collections.abc
+import multiprocessing
+import multiprocessing.managers
 
 import pytest
 
@@ -121,7 +124,7 @@ def _mpirun_extra_args(mpirun_exe):
     """
     try:
         out = subprocess.run([mpirun_exe, "--version"], capture_output=True,
-                             text=True, timeout=30).stdout.lower()
+                             text=True, timeout=10).stdout.lower()
     except Exception:
         return []
     if "open mpi" in out or "open-mpi" in out or "openrte" in out:
@@ -285,6 +288,33 @@ def pytest_configure(config):
                                  or shutil.which("mpirun")
                                  or shutil.which("mpiexec"))
 
+    # The xdist controller hosts the core budget for its workers; a single
+    # pytest process has nothing to coordinate and starts no manager.
+    budget = _core_budget(config)
+    if (budget is not None and not _under_mpi()
+            and config.pluginmanager.hasplugin("xdist")
+            and not hasattr(config, "workerinput")
+            and config.getoption("numprocesses", None)):
+        config.stash[_MANAGER_KEY] = _start_tracker_server(budget)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    """xdist controller hook, once per worker: tell it where the core
+    tracker lives (``workerinput`` is scoped to exactly this session's
+    workers, unlike the environment)."""
+    manager = node.config.stash.get(_MANAGER_KEY, None)
+    if manager is not None:
+        host, port = manager.address
+        node.workerinput["testflo_tracker"] = [host, port,
+                                               manager.authkey.hex()]
+
+
+def pytest_unconfigure(config):
+    manager = config.stash.get(_MANAGER_KEY, None)
+    if manager is not None:
+        manager.shutdown()
+
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_cmdline_main(config):
     """Default to ``--dist worksteal`` when xdist is active and the user did
@@ -384,7 +414,7 @@ def pytest_collection_modifyitems(config, items):
 # fixtures
 # ---------------------------------------------------------------------------
 
-class FakeComm(object):
+class FakeComm:
     """Stand-in for an MPI communicator when running without MPI
     (serial tests, or parallel tests under ``--nompi``)."""
 
@@ -560,25 +590,28 @@ def _core_budget(config):
 def _acquire_cores(item, cores):
     """Reserve ``cores`` from the core budget.
 
-    Returns ``(limiter, None)`` on success (``limiter`` is None when no
-    budget is configured) or ``(None, error_message)`` when the test can
-    never fit or the wait timed out.  The caller must ``release()`` the
-    limiter when the test is done.
+    Returns ``(release, None)`` on success -- ``release`` is a callable, or
+    None when nothing was reserved -- or ``(None, error_message)`` when the
+    test can never fit or the wait timed out.
     """
-    max_cores = _core_budget(item.config)
+    config = item.config
+    max_cores = _core_budget(config)
     if max_cores is None:
         return None, None
     if cores > max_cores:
         return None, (f"test requires {cores} cores but "
                       f"--max-concurrent-cores={max_cores}")
-    limiter = _SlotLimiter(max_cores)
-    timeout = item.config.getoption("--mpi-timeout")
+    tracker = _tracker(config)
+    if tracker is None:
+        return None, None    # single process: nothing to contend with
+    timeout = config.getoption("--mpi-timeout")
+    pid = os.getpid()
     try:
         # bound the wait so a wedged run can't block forever
-        limiter.acquire(cores, timeout=(timeout or 3600) * 10)
+        tracker.acquire(pid, cores, timeout=(timeout or 3600) * 10)
     except TimeoutError as exc:
         return None, str(exc)
-    return limiter, None
+    return lambda: tracker.release(pid), None
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -590,8 +623,8 @@ def pytest_runtest_protocol(item, nextitem):
     see the serial tests other xdist workers are busy with.  MPI tests then
     execute entirely inside the spawned ``mpirun`` (fixtures included, so
     nothing is double-executed); everything else runs pytest's normal
-    protocol in this process.  Without xdist a 1-core test has nothing to
-    contend with and is left to pytest untouched.
+    protocol in this process.  Without xdist there is no tracker and a
+    1-core test is left to pytest untouched.
     """
     if _under_mpi():
         return None  # child / outer-mpirun: plain pytest protocol
@@ -599,13 +632,13 @@ def pytest_runtest_protocol(item, nextitem):
     spec = item.stash[_SPEC_KEY]
     # in-process, only the test's own pool counts (no ranks are spawned)
     cores = spec.cores if launch else max(spec.multiprocessing, 1)
-    if not launch and cores == 1 and "PYTEST_XDIST_TESTRUNUID" not in os.environ:
+    if not launch and cores == 1 and _tracker(item.config) is None:
         return None
 
     ihook = item.ihook
     ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
 
-    limiter, err = _acquire_cores(item, cores)
+    release, err = _acquire_cores(item, cores)
     if err is not None:
         reports = _failed_reports(item, err)
     else:
@@ -617,8 +650,8 @@ def pytest_runtest_protocol(item, nextitem):
                 runtestprotocol(item, nextitem=nextitem)  # logs its own
                 reports = ()
         finally:
-            if limiter is not None:
-                limiter.release()
+            if release is not None:
+                release()
     for rep in reports:
         ihook.pytest_runtest_logreport(report=rep)
 
@@ -661,177 +694,175 @@ def _failed_reports(item, longrepr):
                                        longrepr=longrepr))
 
 
-class _SlotLimiter(object):
-    """Cross-process budget of cores in use by running tests.
+class _CoreTracker:
+    """Budget of cores in use across all xdist workers of one session.
 
-    pytest-xdist workers are independent processes, so the budget is kept
-    in a small JSON state file in the temp directory, keyed by xdist's
-    ``PYTEST_XDIST_TESTRUNUID`` (all workers of one run share it; without
-    xdist the key falls back to this process's pid, where the limiter is
-    trivially correct).
+    One instance lives in a ``multiprocessing.managers`` server process
+    started by the xdist controller; workers call it over a loopback
+    socket, so a waiting ``acquire`` blocks on a condition variable in the
+    server instead of polling anything.  ``holders`` maps worker pid ->
+    cores (an MPI test's ranks are charged to the worker that spawned
+    them, never to the mpirun child).
 
-    The state maps ``pid -> cores`` for every current holder, where pid is
-    the *pytest worker* holding the reservation (never the mpirun child),
-    plus a FIFO of waiting requests so large requests are not starved.
-    Mutual exclusion is an OS byte-range lock on the state file itself
-    (``fcntl.flock`` / ``msvcrt.locking``): no lockfile is created or
-    deleted per cycle, and the OS drops the lock if its holder dies.
+    Requests are served in FIFO order, with one relaxation: a request may
+    pass the ones queued ahead of it if it still leaves enough free cores
+    for the oldest of them.  Serial tests can therefore keep flowing
+    around a waiting multi-core test, but never in a way that stops it
+    from ever fitting.
 
-    Leak safety: a crash inside a spawned mpirun (segfault, OOM, abort)
-    only kills the child; ``subprocess.run`` returns to the worker, which
-    releases normally.  If the worker itself dies while holding cores, its
-    pid is pruned from the state by the next acquire that finds the budget
-    full (``_read_holders(prune=True)``), so a dead worker cannot starve
-    the rest of the run.
+    Leak safety: a crash inside a spawned mpirun only kills the child, and
+    the worker releases normally.  If a *worker* dies while holding or
+    waiting for cores, a reaper thread drops it (``_pid_alive``) so the
+    rest of the run cannot be starved.
     """
 
-    POLL = 0.05         # seconds between acquire attempts when full
+    REAP_INTERVAL = 1.0
 
-    def __init__(self, max_slots):
-        import tempfile
-        self.max_slots = max_slots
-        key = os.environ.get("PYTEST_XDIST_TESTRUNUID", str(os.getpid()))
-        base = os.path.join(tempfile.gettempdir(), f"testflo_pytest_{key}")
-        self.state_path = base + ".slots"
+    def __init__(self, max_cores):
+        self.max_cores = max_cores
+        self.holders = {}     # pid -> cores
+        self.waiting = []     # [pid, cores] tickets, oldest first
+        self.hwm = 0
+        self.cond = threading.Condition()
+        threading.Thread(target=self._reap_forever, daemon=True).start()
 
-    @staticmethod
-    def _pid_alive(pid):
-        if sys.platform == "win32":
-            # os.kill(pid, 0) only does OpenProcess here, which still
-            # succeeds for a process that has *exited* while any handle to
-            # it remains open -- e.g. the xdist controller's Popen handle
-            # on a crashed worker.  Ask the process object whether it is
-            # actually still running.
-            import ctypes
-            SYNCHRONIZE = 0x00100000
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-            if not handle:
-                return False
-            # WaitForSingleObject(0) == WAIT_TIMEOUT (0x102) => still running
-            alive = kernel32.WaitForSingleObject(handle, 0) == 0x102
-            kernel32.CloseHandle(handle)
-            return alive
+    def _fits(self, ticket):
+        in_use = sum(self.holders.values())
+        head = self.waiting[0]
+        need = ticket[1] + (0 if head is ticket else head[1])
+        return in_use + need <= self.max_cores
+
+    def acquire(self, pid, cores, timeout=None):
+        """Block until ``cores`` are reserved for worker ``pid``."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        ticket = [pid, cores]
+        with self.cond:
+            self.waiting.append(ticket)
+            try:
+                while not self._fits(ticket):
+                    remaining = (None if deadline is None
+                                 else deadline - time.monotonic())
+                    if remaining is not None and remaining <= 0:
+                        raise TimeoutError(
+                            f"timed out waiting for {cores} cores "
+                            f"(budget: --max-concurrent-cores={self.max_cores})")
+                    self.cond.wait(remaining)
+                    if ticket not in self.waiting:
+                        raise RuntimeError(
+                            f"worker {pid} was reaped while waiting")
+                self.holders[pid] = self.holders.get(pid, 0) + cores
+                self.hwm = max(self.hwm, sum(self.holders.values()))
+            finally:
+                if ticket in self.waiting:
+                    self.waiting.remove(ticket)
+
+    def release(self, pid):
+        with self.cond:
+            self.holders.pop(pid, None)
+            self.cond.notify_all()
+
+    def stats(self):
+        with self.cond:
+            return {"hwm": self.hwm, "holders": dict(self.holders),
+                    "waiting": [list(t) for t in self.waiting]}
+
+    def reap(self):
+        """Drop holders and waiters whose process has died."""
+        with self.cond:
+            dead = {pid for pid in self.holders if not _pid_alive(pid)}
+            dead |= {t[0] for t in self.waiting if not _pid_alive(t[0])}
+            if dead:
+                self.holders = {p: n for p, n in self.holders.items()
+                                if p not in dead}
+                self.waiting = [t for t in self.waiting if t[0] not in dead]
+                self.cond.notify_all()
+            return dead
+
+    def _reap_forever(self):
+        while True:
+            time.sleep(self.REAP_INTERVAL)
+            self.reap()
+
+
+def _pid_alive(pid):
+    """Whether a worker's process is still running.
+
+    psutil (installed with ``testflo[pytest]``) gets the awkward cases
+    right: on Windows a process that has *exited* still opens fine while
+    any handle to it is held (e.g. the xdist controller's handle on a
+    crashed worker), and an access-denied probe must count as alive rather
+    than reap a live worker.  Without psutil we fall back to
+    ``os.kill(pid, 0)``, which is exact on POSIX; on Windows it errs on the
+    side of "alive", so a crashed worker's cores may stay reserved until
+    the last handle to it closes.
+    """
+    try:
+        import psutil
+    except ImportError:
         try:
             os.kill(pid, 0)
         except OSError:
             return False
         return True
+    return psutil.pid_exists(pid)
 
-    @staticmethod
-    def _oslock(f):
-        if sys.platform == "win32":
-            import msvcrt
-            # LK_LOCK only retries once a second, so spin on LK_NBLCK
-            while True:
-                f.seek(0)
-                try:
-                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                    return
-                except OSError:
-                    time.sleep(0.001)
-        else:
-            import fcntl
-            fcntl.flock(f, fcntl.LOCK_EX)
 
-    @staticmethod
-    def _osunlock(f):
-        if sys.platform == "win32":
-            import msvcrt
-            f.seek(0)
-            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(f, fcntl.LOCK_UN)
+# --- manager plumbing --------------------------------------------------------
 
-    def _locked(self, fn):
-        """Run ``fn(data) -> result`` with the state file exclusively locked
-        and write ``data`` back afterwards; returns ``result``."""
-        fd = os.open(self.state_path, os.O_RDWR | os.O_CREAT)
-        with os.fdopen(fd, "r+") as f:
-            self._oslock(f)
-            try:
-                f.seek(0)
-                try:
-                    data = json.loads(f.read() or "{}")
-                except ValueError:
-                    data = {}
-                data.setdefault("holders", {})    # pid -> cores
-                data.setdefault("waiting", [])    # [[pid, cores, seq]]
-                data.setdefault("seq", 0)
-                data.setdefault("hwm", 0)
-                result = fn(data)
-                f.seek(0)
-                f.truncate()
-                f.write(json.dumps(data))
-                f.flush()
-                return result
-            finally:
-                self._osunlock(f)
+_MANAGER_KEY = pytest.StashKey()
+"""On the xdist controller: the running ``_TrackerManager``."""
 
-    def _prune(self, data):
-        """Drop holders and waiters whose process died without releasing."""
-        data["holders"] = {pid: n for pid, n in data["holders"].items()
-                           if self._pid_alive(int(pid))}
-        data["waiting"] = [w for w in data["waiting"]
-                           if self._pid_alive(int(w[0]))]
+_TRACKER_KEY = pytest.StashKey()
+"""On a worker: its proxy to the session's ``_CoreTracker`` (or None)."""
 
-    def acquire(self, nprocs, timeout=None):
-        """Block until ``nprocs`` cores are reserved for this process.
+_the_tracker = None   # the singleton inside the server process
 
-        Requests are served in FIFO order, with one relaxation: a request
-        may pass the ones queued ahead of it if it still leaves enough free
-        cores for the oldest of them.  Serial tests can therefore keep
-        flowing around a waiting multi-core test, but never in a way that
-        stops it from ever fitting -- without this an 8-rank test on an
-        8-core box would wait until the whole serial queue drained.
-        """
-        deadline = None if timeout is None else time.monotonic() + timeout
-        me = str(os.getpid())
 
-        def room(data):
-            """Whether my request fits now without squeezing out the
-            oldest request queued ahead of me."""
-            in_use = sum(data["holders"].values())
-            mine = next((w[2] for w in data["waiting"] if w[0] == me), None)
-            ahead = [w for w in data["waiting"] if mine is None or w[2] < mine]
-            need = nprocs + (ahead[0][1] if ahead else 0)
-            return in_use + need <= self.max_slots, in_use
+def _get_tracker(max_cores=None):
+    """Server-side factory: the first call (from the controller) creates
+    the tracker, every later call (from workers) returns the same one."""
+    global _the_tracker
+    if _the_tracker is None:
+        _the_tracker = _CoreTracker(max_cores)
+    return _the_tracker
 
-        def try_take(data):
-            ok, in_use = room(data)
-            if not ok:
-                # maybe only because someone died; the pid probes are only
-                # worth doing when we would otherwise wait
-                self._prune(data)
-                ok, in_use = room(data)
-            if ok:
-                self._leave(data, me)
-                data["holders"][me] = nprocs
-                data["hwm"] = max(data["hwm"], in_use + nprocs)
-            elif not any(w[0] == me for w in data["waiting"]):
-                data["seq"] += 1
-                data["waiting"].append([me, nprocs, data["seq"]])
-            return ok
 
-        while True:
-            if self._locked(try_take):
-                return
-            if deadline is not None and time.monotonic() > deadline:
-                self._locked(lambda d: self._leave(d, me))
-                raise TimeoutError(
-                    f"timed out waiting for {nprocs} cores "
-                    f"(budget: --max-concurrent-cores={self.max_slots})")
-            time.sleep(self.POLL)
+class _TrackerManager(multiprocessing.managers.BaseManager):
+    pass
 
-    @staticmethod
-    def _leave(data, me):
-        data["waiting"] = [w for w in data["waiting"] if w[0] != me]
 
-    def release(self):
-        me = str(os.getpid())
+_TrackerManager.register("get_tracker", callable=_get_tracker,
+                         exposed=("acquire", "release", "stats", "reap"))
 
-        self._locked(lambda data: data["holders"].pop(me, None))
+
+def _start_tracker_server(max_cores):
+    """Start the manager process on a loopback port and create the
+    tracker in it.  ``spawn`` is used deliberately: forking a pytest
+    process with live threads (and possibly an initialized MPI) is not
+    safe, and spawn is what Windows and macOS do anyway."""
+    authkey = os.urandom(16)
+    manager = _TrackerManager(address=("127.0.0.1", 0), authkey=authkey,
+                              ctx=multiprocessing.get_context("spawn"))
+    manager.start()
+    manager.authkey = authkey     # pytest_configure_node hands it to workers
+    manager.get_tracker(max_cores)
+    return manager
+
+
+def _tracker(config):
+    """This worker's proxy to the session tracker, connecting on first
+    use; None outside xdist workers (nothing to coordinate with)."""
+    if _TRACKER_KEY not in config.stash:
+        info = getattr(config, "workerinput", {}).get("testflo_tracker")
+        tracker = None
+        if info:
+            host, port, key = info
+            manager = _TrackerManager(address=(host, port),
+                                      authkey=bytes.fromhex(key))
+            manager.connect()
+            tracker = manager.get_tracker()
+        config.stash[_TRACKER_KEY] = tracker
+    return config.stash[_TRACKER_KEY]
 
 
 def _clean_child_env():
@@ -916,9 +947,7 @@ def _run_mpi_item(item):
             "-q", "--no-header", "-p", "no:cacheprovider"])
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=env, timeout=timeout,
-                              cwd=str(config.rootpath))
+        proc = _run_mpirun(cmd, env, str(config.rootpath), timeout)
         data = _read_results(results_path)
     except subprocess.TimeoutExpired:
         return _failed_reports(
@@ -942,6 +971,31 @@ def _run_mpi_item(item):
                   f"--- stderr ---\n{proc.stderr}")
 
     return _reports(item, _aggregate_rank_results(item, data))
+
+
+def _run_mpirun(cmd, env, cwd, timeout):
+    """``subprocess.run`` with a timeout that takes the ranks down too.
+
+    ``subprocess.run(timeout=...)`` SIGKILLs ``mpirun`` alone, which can
+    orphan its ranks.  Instead ask ``mpirun`` to shut down (SIGTERM; both
+    Open MPI and MPICH's hydra then kill their ranks) and only escalate to
+    SIGKILL if it does not comply.  Ctrl-C needs no special handling: the
+    child shares the launcher's process group / console, so the interrupt
+    reaches ``mpirun`` directly and it cleans up its own ranks.
+    """
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, env=env, cwd=cwd) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+            raise
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def _read_results(path):

@@ -43,13 +43,8 @@ def _no_default_core_budget(monkeypatch):
     """Lift the default core budget for the plugin's own tests so they don't
     depend on how many cores the CI runner has.  Tests that exercise the
     budget pass an explicit --max-concurrent-cores, which takes precedence;
-    the test of the default itself removes this again.
-
-    Also drop the xdist run id this test module's own workers export:
-    otherwise the pytester subprocesses would share *this* run's core
-    budget file and deadlock against the workers running them."""
+    the test of the default itself removes this again."""
     monkeypatch.setenv("TESTFLO_PYTEST_OVERSUBSCRIBE", "1")
-    monkeypatch.delenv("PYTEST_XDIST_TESTRUNUID", raising=False)
 
 
 @mpi
@@ -261,24 +256,22 @@ def test_xdist_defaults_to_worksteal(pytester):
 
 
 @pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
-def test_waiting_multicore_test_is_not_starved(pytester, monkeypatch):
+def test_waiting_multicore_test_is_not_starved(pytester):
     """A 3-core test on a 3-core budget with 3 workers churning serial tests
     must get its turn as soon as the running serial tests finish, not after
     the whole serial queue drains: once it is waiting, no new serial test
     may start ahead of it."""
-    monkeypatch.setenv("TMPDIR", str(pytester.path))
-    monkeypatch.setenv("TMP", str(pytester.path))
-    monkeypatch.setenv("TEMP", str(pytester.path))
     pytester.makepyfile(
         """
         import multiprocessing, os, time
         import pytest
 
-        LOG = os.path.join(os.path.dirname(__file__), "intervals.txt")
+        LOGDIR = os.path.join(os.path.dirname(__file__), "intervals")
 
         def _log(name, t0, t1):
-            with open(LOG, "a") as f:
-                f.write(f"{name} {t0} {t1}\\n")
+            os.makedirs(LOGDIR, exist_ok=True)
+            with open(os.path.join(LOGDIR, name), "w") as f:
+                f.write(f"{name} {t0} {t1}")
 
         def burn(x):
             time.sleep(0.3)
@@ -300,12 +293,9 @@ def test_waiting_multicore_test_is_not_starved(pytester, monkeypatch):
                                            "--max-concurrent-cores=3", "-v")
     result.assert_outcomes(passed=13)
     intervals = {}
-    with open(pytester.path / "intervals.txt") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            name, t0, t1 = line.split()
-            intervals[name] = (float(t0), float(t1))
+    for path in (pytester.path / "intervals").iterdir():
+        name, t0, t1 = path.read_text().split()
+        intervals[name] = (float(t0), float(t1))
     p0, p1 = intervals.pop("pool")
     # nothing overlaps the 3-core test ...
     for name, (s0, s1) in intervals.items():
@@ -319,10 +309,8 @@ def test_waiting_multicore_test_is_not_starved(pytester, monkeypatch):
 
 @mpi
 @pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
-def test_concurrent_slots_budget(pytester, monkeypatch):
-    """--mpi-concurrent-slots bounds total in-flight ranks across workers;
-    the limiter's high-water mark proves the budget was respected."""
-    monkeypatch.setenv("TMPDIR", str(pytester.path))
+def test_concurrent_slots_budget(pytester):
+    """The deprecated --mpi-concurrent-slots alias still works."""
     pytester.makepyfile(
         """
         import pytest, time
@@ -340,12 +328,6 @@ def test_concurrent_slots_budget(pytester, monkeypatch):
     result = pytester.runpytest_subprocess("-n", "3",
                                            "--mpi-concurrent-slots=2", "-v")
     result.assert_outcomes(passed=3)
-    import glob, json
-    slot_files = glob.glob(str(pytester.path / "testflo_pytest_*.slots"))
-    assert slot_files, "slot state file not found"
-    state = json.load(open(slot_files[0]))
-    assert state["hwm"] <= 2, f"budget exceeded: hwm={state['hwm']}"
-    assert not state["holders"], "slots leaked"
 
 
 def test_nompi_runs_in_process(pytester):
@@ -477,38 +459,6 @@ def test_default_budget_is_available_cores(pytester, monkeypatch):
     result.assert_outcomes(passed=1, failed=1)
 
 
-@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
-def test_core_budget_multiprocessing(pytester, monkeypatch):
-    """--max-concurrent-cores throttles in-process multiprocessing tests
-    across xdist workers, and the reservation is released afterwards."""
-    monkeypatch.setenv("TMPDIR", str(pytester.path))
-    monkeypatch.setenv("TMP", str(pytester.path))
-    monkeypatch.setenv("TEMP", str(pytester.path))
-    pytester.makepyfile(
-        """
-        import pytest, time
-
-        @pytest.mark.parallel(multiprocessing=2)
-        def test_a(comm): time.sleep(0.5)
-
-        @pytest.mark.parallel(multiprocessing=2)
-        def test_b(comm): time.sleep(0.5)
-
-        @pytest.mark.parallel(multiprocessing=2)
-        def test_c(comm): time.sleep(0.5)
-        """
-    )
-    result = pytester.runpytest_subprocess("-n", "3", "--dist", "load",
-                                           "--max-concurrent-cores=2", "-v")
-    result.assert_outcomes(passed=3)
-    import glob, json
-    slot_files = glob.glob(str(pytester.path / "testflo_pytest_*.slots"))
-    assert slot_files, "slot state file not found"
-    state = json.load(open(slot_files[0]))
-    assert state["hwm"] <= 2, f"budget exceeded: hwm={state['hwm']}"
-    assert not state["holders"], "cores leaked"
-
-
 @mpi
 def test_mpi_kwarg_alias(pytester):
     pytester.makepyfile(
@@ -570,21 +520,18 @@ def test_multiprocessing_pool_in_marked_test(pytester):
 
 
 @pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
-def test_core_budget_serializes_pools(pytester, monkeypatch):
+def test_core_budget_serializes_pools(pytester):
     """Two Pool-using tests that each cost the whole budget must not run at
     the same time, even though xdist hands them to different workers.
 
     Each test logs its wall-clock interval; the intervals must not overlap.
     """
-    monkeypatch.setenv("TMPDIR", str(pytester.path))
-    monkeypatch.setenv("TMP", str(pytester.path))
-    monkeypatch.setenv("TEMP", str(pytester.path))
     pytester.makepyfile(
         """
         import multiprocessing, os, time
         import pytest
 
-        LOG = os.path.join(os.path.dirname(__file__), "intervals.txt")
+        LOGDIR = os.path.join(os.path.dirname(__file__), "intervals")
 
         def burn(x):
             time.sleep(0.3)
@@ -595,8 +542,9 @@ def test_core_budget_serializes_pools(pytester, monkeypatch):
             with multiprocessing.Pool(2) as pool:
                 assert pool.map(burn, [1, 2]) == [1, 2]
             t1 = time.time()
-            with open(LOG, "a") as f:
-                f.write(f"{name} {t0} {t1}\\n")
+            os.makedirs(LOGDIR, exist_ok=True)
+            with open(os.path.join(LOGDIR, name), "w") as f:
+                f.write(f"{name} {t0} {t1}")
 
         @pytest.mark.parallel(multiprocessing=2)
         def test_a(comm): _run("a")
@@ -613,12 +561,9 @@ def test_core_budget_serializes_pools(pytester, monkeypatch):
                                            "--max-concurrent-cores=2", "-v")
     result.assert_outcomes(passed=3)
     intervals = []
-    with open(pytester.path / "intervals.txt") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            name, t0, t1 = line.split()
-            intervals.append((float(t0), float(t1), name))
+    for path in (pytester.path / "intervals").iterdir():
+        name, t0, t1 = path.read_text().split()
+        intervals.append((float(t0), float(t1), name))
     assert len(intervals) == 3
     intervals.sort()
     for (_, end, a), (start, _, b) in zip(intervals, intervals[1:]):
@@ -626,23 +571,21 @@ def test_core_budget_serializes_pools(pytester, monkeypatch):
 
 
 @pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
-def test_serial_tests_count_against_budget(pytester, monkeypatch):
+def test_serial_tests_count_against_budget(pytester):
     """Serial tests cost one core each.  With a budget of 2, a 2-core pool
     test may not overlap with any serial test running on another worker,
     while the serial tests may overlap each other (1 + 1 <= 2)."""
-    monkeypatch.setenv("TMPDIR", str(pytester.path))
-    monkeypatch.setenv("TMP", str(pytester.path))
-    monkeypatch.setenv("TEMP", str(pytester.path))
     pytester.makepyfile(
         """
         import multiprocessing, os, time
         import pytest
 
-        LOG = os.path.join(os.path.dirname(__file__), "intervals.txt")
+        LOGDIR = os.path.join(os.path.dirname(__file__), "intervals")
 
         def _log(name, t0, t1):
-            with open(LOG, "a") as f:
-                f.write(f"{name} {t0} {t1}\\n")
+            os.makedirs(LOGDIR, exist_ok=True)
+            with open(os.path.join(LOGDIR, name), "w") as f:
+                f.write(f"{name} {t0} {t1}")
 
         def burn(x):
             time.sleep(0.4)
@@ -664,12 +607,9 @@ def test_serial_tests_count_against_budget(pytester, monkeypatch):
                                            "--max-concurrent-cores=2", "-v")
     result.assert_outcomes(passed=5)
     intervals = {}
-    with open(pytester.path / "intervals.txt") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            name, t0, t1 = line.split()
-            intervals[name] = (float(t0), float(t1))
+    for path in (pytester.path / "intervals").iterdir():
+        name, t0, t1 = path.read_text().split()
+        intervals[name] = (float(t0), float(t1))
     assert len(intervals) == 5
     p0, p1 = intervals.pop("pool")
     for name, (s0, s1) in intervals.items():
@@ -826,30 +766,75 @@ def test_rank_report_aggregation(pytester):
     assert rep.outcome == "failed" and "(ranks [1] passed)" in rep.longrepr
 
 
-def test_slot_limiter_prunes_dead_holders(tmp_path, monkeypatch):
-    """Cores held by a worker that died are reclaimed on the next acquire,
-    so a crashed worker cannot permanently starve the budget."""
-    import os, sys, json, tempfile
-    from testflo.pytest_plugin import _SlotLimiter
+# ---------------------------------------------------------------------------
+# the core tracker itself (in-process; no xdist or manager needed)
+# ---------------------------------------------------------------------------
 
-    # gettempdir() caches its answer, so patch the cache rather than env
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-    monkeypatch.setenv("PYTEST_XDIST_TESTRUNUID", "deadtest")
+def test_core_tracker_fifo_fairness(monkeypatch):
+    """A 3-core request queued behind two 1-core holders on a 4-core budget
+    must not be starved: once it is waiting, a new 1-core request may only
+    pass it if that still leaves room (it doesn't), so the 1-core request
+    waits, the big one runs as soon as the holders release."""
+    import threading
+    from testflo.pytest_plugin import _CoreTracker
+
+    # pids here are fake; keep the reaper from "cleaning up" after them
+    monkeypatch.setattr(_CoreTracker, "REAP_INTERVAL", 3600)
+    t = _CoreTracker(4)
+    t.acquire(1, 1)
+    t.acquire(2, 1)
+    order = []
+
+    def big():
+        t.acquire(3, 3); order.append("big")
+
+    def small():
+        t.acquire(4, 1); order.append("small")
+
+    tb = threading.Thread(target=big); tb.start()
+    while not t.stats()["waiting"]:
+        pass                                    # big is now queued
+    ts = threading.Thread(target=small); ts.start()
+    import time; time.sleep(0.2)
+    assert order == [], "nothing should have run yet"
+    assert t.stats()["waiting"] == [[3, 3], [4, 1]]
+    t.release(1); t.release(2)
+    tb.join(5); ts.join(5)
+    assert order == ["big", "small"]
+    assert t.stats()["hwm"] == 4
+
+
+def test_core_tracker_reaps_dead_workers():
+    """Cores held (or awaited) by a worker that died are reclaimed, so a
+    crashed worker cannot permanently starve the budget."""
+    import os, sys, threading
+    from testflo.pytest_plugin import _CoreTracker
 
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait()
-    # keep `proc` (and so its Windows process handle) alive: the pruner
+    # keep `proc` (and so its Windows process handle) alive: the reaper
     # must recognise an exited process even while a handle to it is open
-    dead_pid = proc.pid
+    dead = proc.pid
+    me = os.getpid()
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        t = _CoreTracker(4)
+        t.acquire(dead, 4)
+        assert t.reap() == {dead}
+        assert t.stats()["holders"] == {}
+        t.acquire(me, 2)                         # fits immediately now
 
-    limiter = _SlotLimiter(4)
-    with open(limiter.state_path, "w") as f:
-        json.dump({"holders": {str(dead_pid): 4}, "hwm": 4}, f)
-
-    limiter.acquire(2, timeout=5)   # would hang/timeout without pruning
-    state = json.load(open(limiter.state_path))
-    assert str(dead_pid) not in state["holders"]
-    assert state["holders"] == {str(os.getpid()): 2}
-    limiter.release()
-    state = json.load(open(limiter.state_path))
-    assert not state["holders"]
+        # a dead *waiter* at the head of the queue is dropped too, and the
+        # live request behind it proceeds
+        t.waiting.append([dead, 4])
+        done = []
+        th = threading.Thread(
+            target=lambda: (t.acquire(sleeper.pid, 2), done.append(1)))
+        th.start()
+        th.join(0.3)
+        assert not done, "should be blocked behind the dead waiter"
+        assert t.reap() == {dead}
+        th.join(5)
+        assert done and t.stats()["holders"] == {me: 2, sleeper.pid: 2}
+    finally:
+        sleeper.kill()

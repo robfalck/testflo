@@ -33,12 +33,14 @@ dependencies = [
 [project.optional-dependencies]
 pytest = [
     "pytest>=7.4",
+    "psutil",
 ]
 mpi = [
     "mpi4py",
 ]
 test = [
     "pytest>=7.4",
+    "psutil",
     "mpi4py",
     "pytest-xdist",
 ]
@@ -109,6 +111,7 @@ mpi4py = "*"
 [tool.pixi.feature.pytest.pypi-dependencies]
 pytest       = ">=7.4"
 pytest-xdist = "*"
+psutil       = "*"
 
 [tool.pixi.feature.pytest.tasks]
 test_pytest_plugin = "pytest testflo/tests/pytest_tests/test_pytest_plugin.py"

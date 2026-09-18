@@ -263,6 +263,63 @@ When xdist is active the plugin defaults to `--dist worksteal` (unless you
 set `--dist` yourself): a worker waiting for cores cannot hand its test back,
 but idle workers steal the tests queued behind it, so nothing else is held up.
 
+#### How a session runs
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as pytest controller
+    participant M as CoreTracker<br/>(manager process)
+    participant W1 as xdist worker 1
+    participant W2 as xdist worker 2
+    participant R as mpirun ranks
+
+    C->>C: pytest -n 2 : resolve budget<br/>(cores available, or --max-concurrent-cores)
+    C->>M: start manager, create CoreTracker(budget)
+    C->>W1: spawn worker (workerinput: tracker address + authkey)
+    C->>W2: spawn worker (workerinput: tracker address + authkey)
+    C->>C: collect tests, attach ParallelSpec<br/>(mpi, multiprocessing, cores) to each item
+    C->>W1: worksteal scheduler hands out tests
+    C->>W2: worksteal scheduler hands out tests
+
+    rect rgb(235, 245, 235)
+        note over W1,W2: serial tests cost 1 core each
+        W1->>M: acquire(pid, 1)
+        M-->>W1: ok
+        W1->>W1: run test in-process
+        W1->>M: release(pid)
+        W1->>C: TestReport
+    end
+
+    rect rgb(235, 235, 250)
+        note over W2,R: parallel(mpi=4): needs 4 cores
+        W2->>M: acquire(pid, 4)
+        note over M: budget full: request queued (FIFO),<br/>call blocks in the manager - no polling
+        W1->>M: acquire(pid, 1)
+        note over M: would squeeze out the 4-core request<br/>ahead of it - blocks too
+        note over C,W1: idle workers steal the tests<br/>queued behind blocked ones
+        W1->>M: release(pid)
+        M->>M: notify_all: 4 cores now free
+        M-->>W2: ok
+        W2->>R: spawn mpirun -n 4 python -m pytest nodeid
+        R->>R: every rank runs the test, then rank 0<br/>gathers per-rank results to a JSON file
+        R-->>W2: exit (or --mpi-timeout: SIGTERM, then SIGKILL)
+        W2->>M: release(pid)
+        M-->>W1: ok (its 1-core request now fits)
+        W2->>C: synthesized setup/call/teardown TestReports
+    end
+
+    loop every second
+        M->>M: reap holders/waiters whose worker pid died
+    end
+
+    C->>W1: shutdown
+    C->>W2: shutdown
+    C->>M: shutdown manager (pytest_unconfigure)
+    C->>C: terminal summary / JUnit XML
+```
+
+
 ### Core budget
 
 By default a test only starts when the cores it needs are free.  A serial
