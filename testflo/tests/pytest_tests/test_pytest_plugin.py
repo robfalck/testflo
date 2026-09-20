@@ -100,6 +100,41 @@ def test_parametrized_nprocs(pytester):
     result.stdout.fnmatch_lines(["*nprocs=2*", "*nprocs=3*"])
 
 
+def test_collection_sorted_by_core_cost(pytester):
+    """Expensive tests are moved to the front of the collection (stable
+    sort: equal-cost tests keep their file order) so they claim cores
+    while the budget is still empty.  Collection-only, so no MPI needed."""
+    pytester.makepyfile(
+        """
+        import pytest
+
+        def test_s1(): pass
+
+        @pytest.mark.multiprocessing(3)
+        def test_mp3(): pass
+
+        def test_s2(): pass
+
+        @pytest.mark.mpi(2)
+        @pytest.mark.multiprocessing(2)
+        def test_mpi2_mp2(): pass
+
+        @pytest.mark.mpi([2, 3])
+        def test_sizes(): pass
+
+        @pytest.mark.mpi
+        def test_bare(): pass
+        """
+    )
+    result = pytester.runpytest_subprocess("--collect-only", "-q", "--nompi")
+    names = [line.split("::")[-1] for line in result.stdout.lines
+             if "::" in line]
+    assert names == ["test_mpi2_mp2",            # 4
+                     "test_mp3", "test_sizes[nprocs=3]",   # 3
+                     "test_sizes[nprocs=2]", "test_bare",  # 2
+                     "test_s1", "test_s2"]                 # 1
+
+
 @mpi
 def test_n_procs_class_attribute(pytester):
     """testflo-style N_PROCS on a unittest.TestCase triggers MPI spawning."""

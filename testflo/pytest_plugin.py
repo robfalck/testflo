@@ -419,7 +419,11 @@ def pytest_collection_modifyitems(config, items):
 
     No special xdist grouping is done: every test, serial or parallel, is
     distributed freely and reserves its core cost from the shared budget
-    just before it runs (see ``pytest_runtest_protocol``).
+    just before it runs (see ``pytest_runtest_protocol``).  Items are
+    however reordered so the most expensive tests come first: they then
+    ask for cores while the budget is still empty instead of waiting for
+    room at the tail of the run with the other workers idle.  The sort is
+    stable, so tests of equal cost keep their collection (module) order.
     """
     no_mpi = None
     if not _under_mpi() and not config.getoption("--nompi"):
@@ -438,6 +442,8 @@ def pytest_collection_modifyitems(config, items):
         item.stash[_SPEC_KEY] = spec
         if spec.mpi > 1 and no_mpi:
             item.add_marker(pytest.mark.skip(reason=no_mpi))
+
+    items.sort(key=lambda item: item.stash[_SPEC_KEY].cores, reverse=True)
 
 
 # ---------------------------------------------------------------------------
