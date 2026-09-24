@@ -376,6 +376,52 @@ without MPI installed:
 pytest --nompi
 ```
 
+### Coverage
+
+An mpi-marked test executes inside a spawned `mpirun`, never in the pytest
+process that reports it, so coverage has to be collected in the ranks and
+merged back.  This rides entirely on coverage.py's own subprocess support --
+nothing here is specific to `pytest-cov`, so `pytest --cov=...` and
+`coverage run -m pytest` behave the same.
+
+Add to `.coveragerc` (or the equivalent `[tool.coverage.run]` table in
+`pyproject.toml`):
+
+```ini
+[run]
+patch = subprocess        # measure spawned mpirun ranks; implies parallel = true
+source = mypkg
+```
+
+`patch = subprocess` makes coverage export a serialized config to child
+processes, which the `.pth` file it installs picks up to start tracing in
+every rank.  It also forces `parallel = true`, which is **required**: without
+it each rank writes the same data file and they overwrite each other.
+
+If a test spawns its own worker pool (`@pytest.mark.multiprocessing(M)`,
+including inside an mpi rank), add `_exit` as well:
+
+```ini
+[run]
+patch = _exit, subprocess
+```
+
+A pool worker exits through `os._exit`, which skips the `atexit` hook
+coverage normally saves from; `patch = _exit` saves first.  (`concurrency =
+multiprocessing` is the older option for this and is not sufficient on its
+own on Windows/spawn.)
+
+With `coverage run -m pytest`, run `coverage combine` before reporting, as you
+already must with xdist.
+
+If none of this is configured, the plugin falls back to synthesizing the same
+environment for the ranks from whatever coverage is running, so a plain
+`pytest --cov=mypkg` still measures them rather than silently reporting 0%.
+
+**Limitation**: a rank killed by `--mpi-timeout` or `MPI_Abort` never reaches
+its save, so its coverage is missing (not corrupt -- each process writes its
+own file).  A coverage dip after a timeout is that, not a regression.
+
 ### Known issues
 
 **MPICH on macOS**: A networking issue exists when using MPICH with OFI (OpenFabrics Interface) on macOS

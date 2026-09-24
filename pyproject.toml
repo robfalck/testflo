@@ -43,6 +43,9 @@ test = [
     "psutil",
     "mpi4py",
     "pytest-xdist",
+    # coverage of spawned mpirun ranks rides on coverage.py's own subprocess
+    # mechanism; pytest-cov is here so the plugin's own tests can exercise it.
+    "pytest-cov",
 ]
 
 [project.scripts]
@@ -111,6 +114,7 @@ mpi4py = "*"
 [tool.pixi.feature.pytest.pypi-dependencies]
 pytest       = ">=7.4"
 pytest-xdist = "*"
+pytest-cov   = "*"
 psutil       = "*"
 
 [tool.pixi.feature.pytest.tasks]

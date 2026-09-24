@@ -43,6 +43,15 @@ This plugin brings testflo's MPI execution model to pytest:
   ``-ra`` summaries, and in JUnit XML exactly like ordinary tests, with
   per-rank tracebacks and captured output attached.
 
+* Coverage of the spawned ranks rides on coverage.py's own subprocess
+  mechanism rather than anything pytest-cov specific, so ``pytest --cov``
+  and ``coverage run -m pytest`` behave identically.  ``[run] patch =
+  subprocess`` is the supported configuration (it exports a serialized
+  config the ranks' ``.pth`` picks up, and forces ``parallel = true`` so
+  ranks don't overwrite each other's data file); when nothing has been
+  configured, ``_child_coverage_env`` synthesizes the same thing so a plain
+  ``--cov`` run doesn't silently report 0% for MPI-only code.
+
 The host process never imports ``mpi4py.MPI`` (and therefore never
 initializes MPI), mirroring testflo's launcher behavior.  This keeps the
 launcher safe to fork subprocesses from and avoids nested-MPI issues.
@@ -60,6 +69,7 @@ Execution modes
 
 import os
 import sys
+import copy
 import json
 import time
 import shutil
@@ -87,6 +97,19 @@ RESULTS_FLAG = "TESTFLO_PYTEST_RESULTS"
 
 DEFAULT_NPROCS = 2
 """nprocs used when a bare ``@pytest.mark.mpi`` is given with no arguments."""
+
+CHILD_PYTEST_ARGS = ("-q", "--no-header", "-p", "no:cacheprovider",
+                     "-p", "no:xdist", "-o", "addopts=")
+"""Args appended to the ``pytest`` the spawned ``mpirun`` runs.
+
+``-o addopts=``: the child is a plain pytest run and would otherwise inherit
+the project's ini ``addopts``, which is actively harmful here.
+``addopts = -n auto`` would make *every rank* spawn its own xdist cluster --
+``pytest_sessionstart``'s xdist guard returns early in child mode, so nothing
+catches it -- and ``addopts = --cov=pkg`` would start a second coverage on
+top of the one coverage.py's ``.pth`` already started in the rank.
+``-p no:xdist`` is belt and braces against the same thing.
+"""
 
 
 def _is_child():
@@ -939,6 +962,15 @@ def _clean_child_env():
 
     The primary defense, inherited from testflo's design, is that this
     plugin never initializes MPI in the launcher at all.
+
+    Deliberately *preserved*: ``COVERAGE_*`` / ``COV_CORE_*`` and
+    ``PYTHONPATH``.  Coverage of the spawned ranks rides entirely on
+    coverage.py's own subprocess mechanism -- ``COVERAGE_PROCESS_CONFIG``
+    (or ``COVERAGE_PROCESS_START``) tells the ``.pth`` file installed by
+    coverage.py to start tracing in each rank, and it can only do that if
+    it is still importable via ``PYTHONPATH``.  Scrubbing any of these
+    silently drops every line that executes only under MPI, with no error
+    anywhere -- see ``_child_coverage_env``.
     """
     scrub_prefixes = ("PMIX_", "PMI_", "PRTE_", "PRRTE_", "ORTE_",
                       "OMPI_COMM_WORLD_", "OMPI_MCA_ess",
@@ -946,6 +978,54 @@ def _clean_child_env():
                       "OMPI_APP_CTX_", "OMPI_UNIVERSE_")
     return {k: v for k, v in os.environ.items()
             if not k.startswith(scrub_prefixes)}
+
+
+def _child_coverage_env():
+    """Environment additions that make a spawned rank measure coverage.
+
+    Coverage.py already ships the whole mechanism: ``[run] patch =
+    subprocess`` makes it export ``COVERAGE_PROCESS_CONFIG`` (a serialized,
+    absolute-path config) and force ``parallel = True``, and the ``.pth``
+    file it installs starts tracing in any fresh interpreter that inherits
+    that variable.  Ranks spawned by ``mpirun`` are fresh interpreters, so
+    when the user has configured that, ``_clean_child_env`` passing the
+    variable through is all that is required and this returns ``{}``.
+
+    This is the safety net for when they have *not*: a plain ``pytest
+    --cov=pkg`` gives no hint that extra configuration is needed, and the
+    failure mode is silent.  So if coverage is running in this process but
+    nothing has arranged for subprocesses, synthesize the same variable
+    from the live config, with ``parallel`` forced on -- without it every
+    rank writes the *same* data file and they overwrite each other, which
+    is worse than collecting nothing.
+
+    Returns ``{}`` whenever something else already owns tracing in the
+    child: exactly one mechanism must start coverage in a given process.
+    """
+    try:
+        import coverage
+    except ImportError:
+        return {}
+
+    # Already arranged for: by `patch = subprocess`, by the user exporting
+    # it themselves, or by a pytest-cov older than 7.0 (which shipped its
+    # own .pth keyed on COV_CORE_SOURCE; 7.x delegates to coverage.py).
+    if ("COVERAGE_PROCESS_CONFIG" in os.environ
+            or "COVERAGE_PROCESS_START" in os.environ
+            or "COV_CORE_SOURCE" in os.environ):
+        return {}
+
+    cov = coverage.Coverage.current()
+    if cov is None:
+        return {}          # not measuring anything; nothing to propagate
+
+    try:
+        config = copy.deepcopy(cov.config)
+        config.parallel = True
+        return {"COVERAGE_PROCESS_CONFIG": config.serialize()}
+    except Exception:
+        # Never let a coverage problem fail the test run.
+        return {}
 
 
 def _child_nodeid(item):
@@ -984,14 +1064,16 @@ def _run_mpi_item(item):
     env = _clean_child_env()
     env[CHILD_FLAG] = "1"
     env[RESULTS_FLAG] = results_path
+    # the test body runs only inside the ranks, so without this every line
+    # reached only under MPI is missing from the coverage report
+    env.update(_child_coverage_env())
     # match testflo's behavior when testing OpenMDAO-based code
     env.setdefault("OPENMDAO_USE_MPI", "1")
 
     cmd = ([mpirun] + _mpirun_extra_args(mpirun) +
            ["-n", str(item.stash[_SPEC_KEY].mpi),
             sys.executable, "-m", "pytest",
-            _child_nodeid(item),
-            "-q", "--no-header", "-p", "no:cacheprovider"])
+            _child_nodeid(item)] + list(CHILD_PYTEST_ARGS))
 
     try:
         proc = _run_mpirun(cmd, env, str(config.rootpath), timeout)

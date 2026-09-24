@@ -4,6 +4,7 @@ These use pytest's ``pytester`` fixture to run the plugin end-to-end,
 including real mpirun spawning where MPI is available.
 """
 
+import os
 import platform
 import shutil
 import subprocess
@@ -970,3 +971,290 @@ def test_core_tracker_reaps_dead_workers():
         assert done and t.stats()["holders"] == {me: 2, sleeper.pid: 2}
     finally:
         sleeper.kill()
+
+
+# ---------------------------------------------------------------------------
+# coverage of spawned processes
+#
+# The plugin runs mpi tests inside a spawned `mpirun`, so the test body never
+# executes in the process that reports it.  Coverage of those ranks rides on
+# coverage.py's own subprocess mechanism (COVERAGE_PROCESS_CONFIG + the .pth
+# file coverage installs); the plugin's job is only to let it through and, if
+# nothing else arranged for it, to synthesize it.
+# ---------------------------------------------------------------------------
+
+def test_clean_child_env_preserves_coverage_vars(monkeypatch):
+    """Scrubbing any of these would silently drop every line that only runs
+    under MPI, so the preservation is asserted, not left to chance."""
+    from testflo.pytest_plugin import _clean_child_env
+
+    keep = {
+        "COVERAGE_PROCESS_CONFIG": ":data:abc",
+        "COVERAGE_PROCESS_START": "/tmp/.coveragerc",
+        "COVERAGE_FILE": "/tmp/.coverage",
+        "COV_CORE_SOURCE": "mypkg",
+        "PYTHONPATH": "/somewhere/on/the/path",
+    }
+    for k, v in keep.items():
+        monkeypatch.setenv(k, v)
+    # ... while the MPI job-identity scrubbing still happens
+    monkeypatch.setenv("PMIX_NAMESPACE", "pollution")
+    monkeypatch.setenv("OMPI_MCA_ess", "singleton")
+
+    env = _clean_child_env()
+
+    for k, v in keep.items():
+        assert env.get(k) == v, f"{k} must survive into the mpirun child"
+    assert "PMIX_NAMESPACE" not in env
+    assert "OMPI_MCA_ess" not in env
+
+
+def test_child_coverage_env_defers_to_existing(monkeypatch):
+    """Exactly one mechanism may start coverage in a rank.  If anything has
+    already arranged for it, the plugin must not add a second."""
+    from testflo.pytest_plugin import _child_coverage_env
+
+    for var in ("COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START",
+                "COV_CORE_SOURCE"):
+        monkeypatch.delenv("COVERAGE_PROCESS_CONFIG", raising=False)
+        monkeypatch.delenv("COVERAGE_PROCESS_START", raising=False)
+        monkeypatch.delenv("COV_CORE_SOURCE", raising=False)
+        monkeypatch.setenv(var, "already-set")
+        assert _child_coverage_env() == {}, f"{var} already owns tracing"
+
+
+def test_child_coverage_env_forces_parallel(monkeypatch):
+    """The safety net: when coverage is running but nothing arranged for
+    subprocesses, synthesize the config -- with ``parallel`` forced on, or
+    every rank would write the same data file and clobber the others."""
+    coverage = pytest.importorskip("coverage")
+    from coverage.config import CoverageConfig
+    from testflo.pytest_plugin import _child_coverage_env
+
+    for var in ("COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START",
+                "COV_CORE_SOURCE"):
+        monkeypatch.delenv(var, raising=False)
+
+    cov = coverage.Coverage(data_file=None)
+    cov.config.parallel = False          # the situation we must correct
+    monkeypatch.setattr(coverage.Coverage, "current", staticmethod(lambda: cov))
+
+    env = _child_coverage_env()
+
+    assert set(env) == {"COVERAGE_PROCESS_CONFIG"}
+    assert CoverageConfig.deserialize(env["COVERAGE_PROCESS_CONFIG"]).parallel
+    # and the live config must not have been mutated as a side effect
+    assert cov.config.parallel is False
+
+
+def test_child_coverage_env_noop_without_coverage(monkeypatch):
+    """No coverage running -> nothing to propagate."""
+    coverage = pytest.importorskip("coverage")
+    from testflo.pytest_plugin import _child_coverage_env
+
+    for var in ("COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START",
+                "COV_CORE_SOURCE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(coverage.Coverage, "current", staticmethod(lambda: None))
+
+    assert _child_coverage_env() == {}
+
+
+def test_child_pytest_args_neutralize_ini_addopts():
+    """The spawned rank must not inherit the project's ini addopts: `-n auto`
+    there would give every rank its own xdist cluster, and `--cov=pkg` would
+    start a second coverage on top of the .pth-started one."""
+    from testflo.pytest_plugin import CHILD_PYTEST_ARGS
+
+    assert "-o" in CHILD_PYTEST_ARGS
+    assert "addopts=" in CHILD_PYTEST_ARGS
+    i = CHILD_PYTEST_ARGS.index("-o")
+    assert CHILD_PYTEST_ARGS[i + 1] == "addopts="
+    assert "no:xdist" in CHILD_PYTEST_ARGS
+
+
+def test_subprocess_child_coverage(pytester):
+    """End-to-end: a line that only ever executes in a *spawned subprocess*
+    must still be reported as covered.
+
+    This is exactly the mechanism the spawned mpirun ranks rely on -- a rank
+    is a plain subprocess that inherits COVERAGE_PROCESS_CONFIG and starts
+    tracing from coverage.py's .pth file -- so this guards the MPI path on
+    every platform, with or without MPI installed.
+    """
+    pytest.importorskip("pytest_cov")
+
+    pytester.makepyfile(child_code="""
+        def only_in_child(x):
+            computed_in_child = x * 2      # must be reported as covered
+            return computed_in_child
+        """)
+    pytester.makepyfile("""
+        import subprocess, sys
+
+        def test_spawns_child():
+            # stands in for `mpirun -n N python -m pytest <nodeid>`
+            subprocess.run(
+                [sys.executable, "-c",
+                 "import child_code; child_code.only_in_child(21)"],
+                check=True)
+        """)
+    # `patch = subprocess` exports COVERAGE_PROCESS_CONFIG and implies
+    # parallel=true. Section headers must not be indented or configparser
+    # silently ignores the file ("Remainder of file ignored").
+    pytester.path.joinpath(".coveragerc").write_text(
+        "[run]\npatch = subprocess\nsource = child_code\n")
+
+    result = pytester.runpytest_subprocess(
+        "--cov=child_code", "--cov-report=term-missing")
+
+    result.assert_outcomes(passed=1)
+    # the child-only line is covered => 100%, nothing missing
+    result.stdout.fnmatch_lines(["*child_code.py*100%*"])
+
+
+@pytest.mark.skipif(platform.system() == "Windows",
+                    reason="multiprocessing pool children do not flush "
+                           "coverage on Windows/spawn; see the coverage "
+                           "notes in the README")
+def test_multiprocessing_pool_coverage(pytester):
+    """Pool workers need more than the ranks do: a pool child exits through
+    ``os._exit`` (``BaseProcess._bootstrap``), which skips the atexit hook
+    coverage saves from, so ``patch = _exit`` is required on top of
+    ``patch = subprocess``.  Relevant to the composed
+    ``mpi(N)`` + ``multiprocessing(M)`` case, where the pool lives inside a
+    rank.
+    """
+    pytest.importorskip("pytest_cov")
+
+    pytester.makepyfile(pool_code="""
+        def only_in_worker(x):
+            computed_in_child = x * 2      # must be reported as covered
+            return computed_in_child
+        """)
+    pytester.makepyfile("""
+        import multiprocessing
+        import pytest
+        from pool_code import only_in_worker
+
+        @pytest.mark.multiprocessing(2)
+        def test_pool():
+            with multiprocessing.Pool(2) as pool:
+                assert pool.map(only_in_worker, [1, 2]) == [2, 4]
+        """)
+    pytester.path.joinpath(".coveragerc").write_text(
+        "[run]\npatch = _exit, subprocess\nsource = pool_code\n")
+
+    result = pytester.runpytest_subprocess(
+        "--cov=pool_code", "--cov-report=term-missing")
+
+    result.assert_outcomes(passed=1)
+    result.stdout.fnmatch_lines(["*pool_code.py*100%*"])
+
+
+@mpi
+def test_mpi_rank_coverage(pytester):
+    """The payoff: a line that only ever executes inside a spawned mpirun
+    rank must be reported as covered.  Without the coverage env reaching the
+    ranks this silently reports 0% for every MPI-only code path."""
+    pytest.importorskip("pytest_cov")
+
+    pytester.makepyfile(rank_code="""
+        def only_under_mpi(rank):
+            computed_in_rank = rank + 1    # must be reported as covered
+            return computed_in_rank
+        """)
+    pytester.makepyfile("""
+        import pytest
+        from rank_code import only_under_mpi
+
+        @pytest.mark.mpi(2)
+        def test_ranks(comm):
+            assert only_under_mpi(comm.rank) == comm.rank + 1
+        """)
+    pytester.path.joinpath(".coveragerc").write_text(
+        "[run]\npatch = subprocess\nsource = rank_code\n")
+
+    result = pytester.runpytest_subprocess(
+        "--cov=rank_code", "--cov-report=term-missing")
+
+    result.assert_outcomes(passed=1)
+    result.stdout.fnmatch_lines(["*rank_code.py*100%*"])
+
+
+@mpi
+@pytest.mark.skipif(platform.system() == "Windows",
+                    reason="multiprocessing pool children do not flush "
+                           "coverage on Windows/spawn")
+def test_mpi_rank_with_pool_coverage(pytester):
+    """The composed case: mpi(N) + multiprocessing(M), where the measured
+    line runs in a pool worker *inside* an mpirun rank -- two process
+    boundaries from the session that reports it."""
+    pytest.importorskip("pytest_cov")
+
+    pytester.makepyfile(nested_code="""
+        def in_pool_in_rank(x):
+            deeply_nested = x * 3          # must be reported as covered
+            return deeply_nested
+        """)
+    pytester.makepyfile("""
+        import multiprocessing
+        import pytest
+        from nested_code import in_pool_in_rank
+
+        @pytest.mark.mpi(2)
+        @pytest.mark.multiprocessing(2)
+        def test_pool_in_rank(comm):
+            with multiprocessing.Pool(2) as pool:
+                assert pool.map(in_pool_in_rank, [1, 2]) == [3, 6]
+        """)
+    pytester.path.joinpath(".coveragerc").write_text(
+        "[run]\npatch = _exit, subprocess\nsource = nested_code\n")
+
+    result = pytester.runpytest_subprocess(
+        "--cov=nested_code", "--cov-report=term-missing")
+
+    result.assert_outcomes(passed=1)
+    result.stdout.fnmatch_lines(["*nested_code.py*100%*"])
+
+
+def test_child_coverage_env_payload_actually_measures(tmp_path, monkeypatch):
+    """Closes the loop on the safety net: the env it synthesizes must really
+    make a spawned child record coverage, not merely look plausible.
+
+    Uses a plain subprocess, which is what an mpirun rank is, so this runs
+    without MPI.
+    """
+    coverage = pytest.importorskip("coverage")
+    import sys
+    from testflo.pytest_plugin import _child_coverage_env
+
+    for var in ("COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START",
+                "COV_CORE_SOURCE"):
+        monkeypatch.delenv(var, raising=False)
+
+    target = tmp_path / "child_target.py"
+    target.write_text("def run():\n    measured = 1 + 1\n    return measured\n")
+    data_file = tmp_path / ".coverage"
+
+    # stand in for the coverage the user's `pytest --cov` has running, with
+    # no subprocess support configured -- the case the net exists for
+    cov = coverage.Coverage(data_file=str(data_file), source=[str(tmp_path)])
+    cov.config.parallel = False
+    monkeypatch.setattr(coverage.Coverage, "current", staticmethod(lambda: cov))
+
+    env = dict(os.environ, **_child_coverage_env())
+    assert "COVERAGE_PROCESS_CONFIG" in env
+
+    subprocess.run([sys.executable, "-c", "import child_target; child_target.run()"],
+                   cwd=tmp_path, env=env, check=True)
+
+    written = list(tmp_path.glob(".coverage.*"))
+    assert written, "the child recorded no coverage at all"
+
+    combined = coverage.Coverage(data_file=str(data_file))
+    combined.combine()
+    data = combined.get_data()
+    measured = [f for f in data.measured_files() if "child_target" in f]
+    assert measured, f"child_target.py not measured; got {data.measured_files()}"
+    assert 2 in data.lines(measured[0]), "the child-only line was not recorded"
