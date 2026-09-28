@@ -201,8 +201,8 @@ def test_foo(comm):
     assert comm.size == 4
 ```
 
-`@pytest.mark.mpi(N)` is the canonical form; `nprocs=N` is an equivalent
-keyword form. A bare `@pytest.mark.mpi` defaults to `DEFAULT_NPROCS` (2).
+`@pytest.mark.mpi(N)` is the canonical form; `nprocs=N` is left for compatibility
+with previous versions. A bare `@pytest.mark.mpi` defaults to `DEFAULT_NPROCS` (2).
 To parametrize over multiple sizes, pass a list:
 
 ```python
@@ -439,7 +439,6 @@ If encountered, switch to OpenMPI as a workaround.
 | `--mpirun-exe=PATH` | Path to mpirun/mpiexec if not on PATH |
 | `--max-concurrent-cores=N` | Max total core cost of tests in flight (serial = 1) across all xdist workers (default: cores available to the process) |
 | `--oversubscribe` | Remove the core budget entirely (env: `TESTFLO_PYTEST_OVERSUBSCRIBE=1`) |
-| `--mpi-concurrent-slots=N` | Deprecated alias for `--max-concurrent-cores` |
 
 [1]: https://badge.fury.io/py/testflo.svg "PyPI Version"
 [2]: https://badge.fury.io/py/testflo "testflo @PyPI"
