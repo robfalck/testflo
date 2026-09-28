@@ -651,7 +651,7 @@ def _acquire_cores(item, cores):
 
     Returns ``(release, None)`` on success -- ``release`` is a callable, or
     None when nothing was reserved -- or ``(None, error_message)`` when the
-    test can never fit or the wait timed out.
+    test can never fit within the budget.
     """
     config = item.config
     max_cores = _core_budget(config)
@@ -663,13 +663,8 @@ def _acquire_cores(item, cores):
     tracker = _tracker(config)
     if tracker is None:
         return None, None    # single process: nothing to contend with
-    timeout = config.getoption("--mpi-timeout")
     pid = os.getpid()
-    try:
-        # bound the wait so a wedged run can't block forever
-        tracker.acquire(pid, cores, timeout=(timeout or 3600) * 10)
-    except TimeoutError as exc:
-        return None, str(exc)
+    tracker.acquire(pid, cores)
     return lambda: tracker.release(pid), None
 
 
@@ -802,21 +797,14 @@ class _CoreTracker:
         need = ticket[1] + (0 if head is ticket else head[1])
         return in_use + need <= self.max_cores
 
-    def acquire(self, pid, cores, timeout=None):
+    def acquire(self, pid, cores):
         """Block until ``cores`` are reserved for worker ``pid``."""
-        deadline = None if timeout is None else time.monotonic() + timeout
         ticket = [pid, cores]
         with self.cond:
             self.waiting.append(ticket)
             try:
                 while not self._fits(ticket):
-                    remaining = (None if deadline is None
-                                 else deadline - time.monotonic())
-                    if remaining is not None and remaining <= 0:
-                        raise TimeoutError(
-                            f"timed out waiting for {cores} cores "
-                            f"(budget: --max-concurrent-cores={self.max_cores})")
-                    self.cond.wait(remaining)
+                    self.cond.wait()
                     if ticket not in self.waiting:
                         raise RuntimeError(
                             f"worker {pid} was reaped while waiting")
