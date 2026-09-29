@@ -98,7 +98,8 @@ def test_parametrized_nprocs(pytester):
     )
     result = pytester.runpytest_subprocess("-v")
     result.assert_outcomes(passed=2)
-    result.stdout.fnmatch_lines(["*nprocs=2*", "*nprocs=3*"])
+    # collection is sorted by descending core cost, so nprocs=3 runs first
+    result.stdout.fnmatch_lines(["*nprocs=3*", "*nprocs=2*"])
 
 
 def test_collection_sorted_by_core_cost(pytester):
@@ -833,7 +834,8 @@ def test_mpi_sizes_parametrized_with_pool(pytester):
     )
     result = pytester.runpytest_subprocess("--max-concurrent-cores=6", "-v")
     result.assert_outcomes(passed=2)
-    result.stdout.fnmatch_lines(["*nprocs=2*", "*nprocs=3*"])
+    # collection is sorted by descending core cost, so nprocs=3 runs first
+    result.stdout.fnmatch_lines(["*nprocs=3*", "*nprocs=2*"])
     # budget of 5 fits the 2-rank case (4 cores) but not the 3-rank (6)
     result = pytester.runpytest_subprocess("--max-concurrent-cores=5", "-v")
     result.assert_outcomes(passed=1, failed=1)
@@ -1118,10 +1120,13 @@ def test_subprocess_child_coverage(pytester):
                            "coverage on Windows/spawn; see the coverage "
                            "notes in the README")
 def test_multiprocessing_pool_coverage(pytester):
-    """Pool workers need more than the ranks do: a pool child exits through
-    ``os._exit`` (``BaseProcess._bootstrap``), which skips the atexit hook
-    coverage saves from, so ``patch = _exit`` is required on top of
-    ``patch = subprocess``.  Relevant to the composed
+    """Pool workers need more than the ranks do: on some platforms a pool
+    child exits through ``os._exit``, which skips the atexit hook coverage
+    saves from (``patch = _exit`` covers that).  On others (macOS/spawn), a
+    worker still idle when ``with Pool(...) as pool:`` exits is instead
+    SIGTERM'd by ``Pool.terminate()`` before it ever gets a next task, which
+    bypasses atexit entirely unless ``sigterm = true`` installs coverage's
+    own handler to save first.  Relevant to the composed
     ``mpi(N)`` + ``multiprocessing(M)`` case, where the pool lives inside a
     rank.
     """
@@ -1143,7 +1148,7 @@ def test_multiprocessing_pool_coverage(pytester):
                 assert pool.map(only_in_worker, [1, 2]) == [2, 4]
         """)
     pytester.path.joinpath(".coveragerc").write_text(
-        "[run]\npatch = _exit, subprocess\nsource = pool_code\n")
+        "[run]\npatch = _exit, subprocess\nsigterm = true\nsource = pool_code\n")
 
     result = pytester.runpytest_subprocess(
         "--cov=pool_code", "--cov-report=term-missing")
@@ -1209,7 +1214,7 @@ def test_mpi_rank_with_pool_coverage(pytester):
                 assert pool.map(in_pool_in_rank, [1, 2]) == [3, 6]
         """)
     pytester.path.joinpath(".coveragerc").write_text(
-        "[run]\npatch = _exit, subprocess\nsource = nested_code\n")
+        "[run]\npatch = _exit, subprocess\nsigterm = true\nsource = nested_code\n")
 
     result = pytester.runpytest_subprocess(
         "--cov=nested_code", "--cov-report=term-missing")

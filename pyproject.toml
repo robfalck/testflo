@@ -78,6 +78,7 @@ exclude-newer = "7d"
 [tool.pixi.dependencies]
 python  = ">=3.11"
 pip     = "*"
+pytest = ">=9.1.1,<10"
 
 [tool.pixi.pypi-dependencies]
 testflo = { path = ".", editable = true }
