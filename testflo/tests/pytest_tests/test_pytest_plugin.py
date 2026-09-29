@@ -98,8 +98,6 @@ def test_parametrized_nprocs(pytester):
     )
     result = pytester.runpytest_subprocess("-v")
     result.assert_outcomes(passed=2)
-    # collection is sorted by descending core cost, so nprocs=3 runs first
-    result.stdout.fnmatch_lines(["*nprocs=3*", "*nprocs=2*"])
 
 
 def test_collection_sorted_by_core_cost(pytester):
@@ -834,8 +832,6 @@ def test_mpi_sizes_parametrized_with_pool(pytester):
     )
     result = pytester.runpytest_subprocess("--max-concurrent-cores=6", "-v")
     result.assert_outcomes(passed=2)
-    # collection is sorted by descending core cost, so nprocs=3 runs first
-    result.stdout.fnmatch_lines(["*nprocs=3*", "*nprocs=2*"])
     # budget of 5 fits the 2-rank case (4 cores) but not the 3-rank (6)
     result = pytester.runpytest_subprocess("--max-concurrent-cores=5", "-v")
     result.assert_outcomes(passed=1, failed=1)
