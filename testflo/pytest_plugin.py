@@ -323,6 +323,10 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    # matches testflo's own CLI (see main.py), so tests written against
+    # TESTFLO_RUNNING behave the same whether run via `testflo` or `pytest`.
+    os.environ['TESTFLO_RUNNING'] = '1'
+
     config.addinivalue_line(
         "markers",
         "mpi(N): run this test under MPI on N processes (default: "
@@ -352,9 +356,13 @@ def pytest_configure(config):
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_configure_node(node):
-    """xdist controller hook, once per worker: tell it where the core
+    """
+    Hook for xdist controller, once per worker.
+
+    tell it where the core
     tracker lives (``workerinput`` is scoped to exactly this session's
-    workers, unlike the environment)."""
+    workers, unlike the environment).
+    """
     manager = node.config.stash.get(_MANAGER_KEY, None)
     if manager is not None:
         host, port = manager.address
