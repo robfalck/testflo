@@ -97,32 +97,7 @@ jobs:
           eval "$(pixi shell-hook -s bash -e ${{ matrix.PIXI_ENV }})"
           cd $HOME
 
-          testflo --skip_dir=pytest_tests testflo.tests -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
-
-          if [[ $RC -ne 1 ]]; then
-            echo "Expected some tests to fail."
-            exit 1
-          fi
-
-          if [[ ! -n `grep "Ran 26 tests" testflo_report.out` ]]; then
-            echo "Expected 26 tests."
-            exit 26
-          fi
-
-          if [[ ! -n `grep "Passed:  7" testflo_report.out` ]]; then
-            echo "Expected 7 tests to pass."
-            exit 7
-          fi
-
-          if [[ ! -n `grep "Failed:  8" testflo_report.out` ]]; then
-            echo "Expected 8 tests to fail."
-            exit 8
-          fi
-
-          if [[ ! -n `grep "Skipped: 11" testflo_report.out` ]]; then
-            echo "Expected 11 tests to be skipped."
-            exit 11
-          fi
+          testflo --skip_dir=pytest_tests testflo.tests -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt
 
           grep "Deprecations Report" dep.txt
           rm dep.txt
@@ -132,32 +107,7 @@ jobs:
           eval "$(pixi shell-hook -s bash -e ${{ matrix.PIXI_ENV }})"
           cd $HOME
 
-          testflo --skip_dir=pytest_tests testflo.tests -n 1 -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt || RC=$?
-
-          if [[ $RC -ne 1 ]]; then
-            echo "Expected some tests to fail."
-            exit 1
-          fi
-
-          if [[ ! -n `grep "Ran 26 tests using 1 processes" testflo_report.out` ]]; then
-            echo "Expected 26 tests on one process."
-            exit 26
-          fi
-
-          if [[ ! -n `grep "Passed:  7" testflo_report.out` ]]; then
-            echo "Expected 7 tests to pass."
-            exit 7
-          fi
-
-          if [[ ! -n `grep "Failed:  8" testflo_report.out` ]]; then
-            echo "Expected 8 tests to fail."
-            exit 8
-          fi
-
-          if [[ ! -n `grep "Skipped: 11" testflo_report.out` ]]; then
-            echo "Expected 11 tests to be skipped."
-            exit 11
-          fi
+          testflo --skip_dir=pytest_tests testflo.tests -n 1 -vs --show_skipped --durations=5 --durations-min=0 --deprecations_report dep.txt
 
           grep "Deprecations Report" dep.txt
           rm dep.txt

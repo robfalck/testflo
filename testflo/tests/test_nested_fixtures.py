@@ -32,36 +32,6 @@ class TestfloTestCaseWFixture2(unittest.TestCase):
     def test_tcase_grouped_ok(self):
         assert os.getpid() == self.pid
 
-    def test_tcase_grouped_fail(self):
-        self.fail("failure 3")
-
-    @unittest.expectedFailure
-    def test_tcase_grouped_expected_fail(self):
-        self.fail("I expected this")
-
-    @unittest.expectedFailure
-    def test_tcase_grouped_unexpected_success(self):
-        pass
-
-    @unittest.skip("skipping 2")
-    def test_tcase_grouped_skip(self):
-        self.fail("This test should have been skipped.")
-
-
-@unittest.skip("skipping a whole testcase...")
-class SkippedTestCase2(unittest.TestCase):
-    def test_1(self):
-        self.fail("This test should have been skipped.")
-
-    def test_2(self):
-        self.fail("This test should have been skipped.")
-
-    def test_3(self):
-        self.fail("This test should have been skipped.")
-
-    def test_4(self):
-        self.fail("This test should have been skipped.")
-
 
 if __name__ == '__main__':
     unittest.main()

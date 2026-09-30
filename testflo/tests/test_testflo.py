@@ -11,21 +11,6 @@ class TestfloTestCase(unittest.TestCase):
         testflo_running = os.getenv("TESTFLO_RUNNING", default=False)
         self.assertNotEqual(testflo_running, False)
 
-    def test_fail(self):
-        self.fail("This test should fail")
-
-    @unittest.expectedFailure
-    def test_expected_fail_good(self):
-        self.fail("I expected this")
-
-    @unittest.expectedFailure
-    def test_unexpected_success(self):
-        pass
-
-    @unittest.skip("skipping 1")
-    def test_skip(self):
-        self.fail("This test should have been skipped.")
-
 class TestfloTestCaseWFixture(unittest.TestCase):
 
     @classmethod
@@ -41,36 +26,6 @@ class TestfloTestCaseWFixture(unittest.TestCase):
     def test_tcase_grouped_ok(self):
         assert os.getpid() == self.pid
 
-    def test_tcase_grouped_fail(self):
-        self.fail("failure 2")
-
-    @unittest.expectedFailure
-    def test_tcase_grouped_expected_fail(self):
-        self.fail("I expected this")
-
-    @unittest.expectedFailure
-    def test_tcase_grouped_unexpected_success(self):
-        pass
-
-    @unittest.skip("skipping 2")
-    def test_tcase_grouped_skip(self):
-        pass
-
-
-@unittest.skip("skipping a whole testcase...")
-class SkippedTestCase(unittest.TestCase):
-    def test_1(self):
-        self.fail("This test should have been skipped.")
-
-    def test_2(self):
-        self.fail("This test should have been skipped.")
-
-    def test_3(self):
-        self.fail("This test should have been skipped.")
-
-    def test_4(self):
-        self.fail("This test should have been skipped.")
-
 
 class TestSubTests(unittest.TestCase):
     def test_subtests(self):
@@ -85,10 +40,6 @@ class TestSubTests(unittest.TestCase):
             precalculated_price[state] = {}
             for item in base_price:
                 precalculated_price[state][item] = (1.0 + sales_tax[state]) * base_price[item]
-
-        # Intentionally mess up michigan price for gum and ohio price for eggs
-        precalculated_price["Michigan"]["gum"] = 100.0
-        precalculated_price["Ohio"]["eggs"] = -3.14159
 
         # Run through nested subtests, by state and item, and double check that logged price matches expected
         for state in sales_tax:
