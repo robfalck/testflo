@@ -201,8 +201,8 @@ def test_foo(comm):
     assert comm.size == 4
 ```
 
-`@pytest.mark.mpi(N)` is the canonical form; `nprocs=N` is left for compatibility
-with previous versions. A bare `@pytest.mark.mpi` defaults to `DEFAULT_NPROCS` (2).
+`@pytest.mark.mpi(N)` is the canonical form; `nprocs=N` is an alias. A bare
+`@pytest.mark.mpi` defaults to `DEFAULT_NPROCS` (2).
 To parametrize over multiple sizes, pass a list:
 
 ```python
@@ -353,7 +353,6 @@ pytest --oversubscribe
 ```
 
 An explicit `--max-concurrent-cores` takes precedence over `--oversubscribe`.
-(`--mpi-concurrent-slots` is a deprecated alias for `--max-concurrent-cores`.)
 
 ### Guarding against deadlocks
 

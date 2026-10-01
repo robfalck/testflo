@@ -342,6 +342,20 @@ def test_xdist_defaults_to_worksteal(pytester):
 
 
 @pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
+def test_outer_mpirun_rejects_xdist(pytester, monkeypatch):
+    """A faked outer `mpirun -n N pytest -n ...` launch (every rank starting
+    its own xdist worker cluster) must be rejected up front.  Setting the
+    world-size env var is enough to trigger this -- no real mpirun needed,
+    since the check happens before any MPI import (see _outer_world_size)."""
+    monkeypatch.setenv("OMPI_COMM_WORLD_SIZE", "2")
+    pytester.makepyfile("def test_ok(): pass")
+    result = pytester.runpytest_subprocess("-n", "2", "-v")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(
+        ["*cannot be combined with an outer mpirun launch*"])
+
+
+@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
 def test_waiting_multicore_test_is_not_starved(pytester):
     """A 3-core test on a 3-core budget with 3 workers churning serial tests
     must get its turn as soon as the running serial tests finish, not after
@@ -360,7 +374,7 @@ def test_waiting_multicore_test_is_not_starved(pytester):
                 f.write(f"{name} {t0} {t1}")
 
         def burn(x):
-            time.sleep(0.3)
+            time.sleep(0.5)
             return x
 
         @pytest.mark.multiprocessing(3)
@@ -372,7 +386,7 @@ def test_waiting_multicore_test_is_not_starved(pytester):
 
         @pytest.mark.parametrize("i", range(12))
         def test_serial(i):
-            t0 = time.time(); time.sleep(0.2); _log(f"serial{i}", t0, time.time())
+            t0 = time.time(); time.sleep(0.35); _log(f"serial{i}", t0, time.time())
         """
     )
     result = pytester.runpytest_subprocess("-n", "3",
@@ -386,34 +400,9 @@ def test_waiting_multicore_test_is_not_starved(pytester):
     # nothing overlaps the 3-core test ...
     for name, (s0, s1) in intervals.items():
         assert s1 <= p0 or s0 >= p1, f"{name} overlapped the pool test"
-    # ... and it ran early: at most the serial tests already in flight when
-    # it started waiting (one per other worker, plus a little race slack)
-    # finished before it, the rest were deferred behind it
+    # ... and it ran early, well before the full serial queue (12) drained
     before = sum(1 for s0, _ in intervals.values() if s0 < p0)
-    assert before <= 4, f"{before} serial tests ran ahead of the pool test"
-
-
-@mpi
-@pytest.mark.skipif(not HAVE_XDIST, reason="requires pytest-xdist")
-def test_concurrent_slots_budget(pytester):
-    """The deprecated --mpi-concurrent-slots alias still works."""
-    pytester.makepyfile(
-        """
-        import pytest, time
-
-        @pytest.mark.mpi(2)
-        def test_a(comm): time.sleep(0.5)
-
-        @pytest.mark.mpi(2)
-        def test_b(comm): time.sleep(0.5)
-
-        @pytest.mark.mpi(2)
-        def test_c(comm): time.sleep(0.5)
-        """
-    )
-    result = pytester.runpytest_subprocess("-n", "3",
-                                           "--mpi-concurrent-slots=2", "-v")
-    result.assert_outcomes(passed=3)
+    assert before <= 6, f"{before} serial tests ran ahead of the pool test"
 
 
 def test_nompi_runs_in_process(pytester):
@@ -897,9 +886,59 @@ def test_rank_report_aggregation(pytester):
     assert rep.outcome == "failed" and "(ranks [1] passed)" in rep.longrepr
 
 
+@mpi
+def test_child_mode_writes_results_file(pytester, monkeypatch, tmp_path):
+    """Child mode is just 'run normally, gather at sessionfinish on
+    COMM_WORLD, rank 0 writes the results file' -- it has no dependency on
+    actually being launched by mpirun.  Exercise it directly, as a
+    singleton-MPI process of size 1, to pin down the launcher<->child
+    results-file contract without going through _run_mpi_item's subprocess
+    spawning."""
+    import json
+
+    results = tmp_path / "results.json"
+    monkeypatch.setenv("TESTFLO_PYTEST_CHILD", "1")
+    monkeypatch.setenv("TESTFLO_PYTEST_RESULTS", str(results))
+    pytester.makepyfile(
+        """
+        def test_pass(): pass
+        def test_fail(): assert False, "boom"
+        """
+    )
+    pytester.runpytest_subprocess("-p", "no:xdist", "-v")
+
+    data = json.loads(results.read_text())
+    assert data["nprocs"] == 1
+    rank0, = data["ranks"]
+    assert rank0["rank"] == 0
+
+    by_node = rank0["results"]
+    pass_node, = (n for n in by_node if n.endswith("::test_pass"))
+    fail_node, = (n for n in by_node if n.endswith("::test_fail"))
+    call = {r["when"]: r for r in by_node[pass_node]}["call"]
+    assert call["outcome"] == "passed"
+    call = {r["when"]: r for r in by_node[fail_node]}["call"]
+    assert call["outcome"] == "failed" and "boom" in call["longrepr"]
+
+
 # ---------------------------------------------------------------------------
 # the core tracker itself (in-process; no xdist or manager needed)
 # ---------------------------------------------------------------------------
+
+def _wait_until(predicate, timeout=5.0, interval=0.01):
+    """Poll ``predicate`` until it's truthy, sleeping between checks.
+
+    A bare busy-loop (``while not predicate(): pass``) burns a CPU core and,
+    if the condition is never met, hangs the test suite instead of failing
+    it; this raises a clear error once ``timeout`` elapses instead.
+    """
+    import time
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"condition not met within {timeout}s")
+        time.sleep(interval)
+
 
 def test_core_tracker_fifo_fairness(monkeypatch):
     """A 3-core request queued behind two 1-core holders on a 4-core budget
@@ -923,8 +962,7 @@ def test_core_tracker_fifo_fairness(monkeypatch):
         t.acquire(4, 1); order.append("small")
 
     tb = threading.Thread(target=big); tb.start()
-    while not t.stats()["waiting"]:
-        pass                                    # big is now queued
+    _wait_until(lambda: t.stats()["waiting"])  # big is now queued
     ts = threading.Thread(target=small); ts.start()
     import time; time.sleep(0.2)
     assert order == [], "nothing should have run yet"

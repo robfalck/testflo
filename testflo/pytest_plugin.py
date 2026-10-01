@@ -316,10 +316,6 @@ def pytest_addoption(parser):
         help="remove the core budget: run tests regardless of how many "
              "cores are free (same as TESTFLO_PYTEST_OVERSUBSCRIBE=1). "
              "An explicit --max-concurrent-cores still applies.")
-    group.addoption(
-        "--mpi-concurrent-slots", action="store", type=int, default=None,
-        metavar="N", dest="max_concurrent_cores",
-        help="deprecated alias for --max-concurrent-cores.")
 
 
 def pytest_configure(config):
