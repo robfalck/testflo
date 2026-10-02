@@ -944,7 +944,12 @@ def test_core_tracker_fifo_fairness(monkeypatch):
     """A 3-core request queued behind two 1-core holders on a 4-core budget
     must not be starved: once it is waiting, a new 1-core request may only
     pass it if that still leaves room (it doesn't), so the 1-core request
-    waits, the big one runs as soon as the holders release."""
+    waits while the holders are up. Once they release, there's exactly
+    enough room for both the queued 3-core and 1-core requests to be
+    granted (3+1 == 4), so which of the two threads actually records its
+    entry first is a scheduling detail, not a fairness guarantee; the
+    guarantee is that neither is starved and the budget is never exceeded.
+    """
     import threading
     from testflo.pytest_plugin import _CoreTracker
 
@@ -969,7 +974,7 @@ def test_core_tracker_fifo_fairness(monkeypatch):
     assert t.stats()["waiting"] == [[3, 3], [4, 1]]
     t.release(1); t.release(2)
     tb.join(5); ts.join(5)
-    assert order == ["big", "small"]
+    assert set(order) == {"big", "small"}, order
     assert t.stats()["hwm"] == 4
 
 
