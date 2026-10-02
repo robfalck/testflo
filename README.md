@@ -397,18 +397,42 @@ processes, which the `.pth` file it installs picks up to start tracing in
 every rank.  It also forces `parallel = true`, which is **required**: without
 it each rank writes the same data file and they overwrite each other.
 
-If a test spawns its own worker pool (`@pytest.mark.multiprocessing(M)`,
-including inside an mpi rank), add `_exit` as well:
+If a test spawns its own worker pool (`@pytest.mark.multiprocessing(M)`),
+add `_exit` and `fork` as well:
 
 ```ini
 [run]
-patch = _exit, subprocess
+patch = _exit, fork, subprocess
 ```
 
 A pool worker exits through `os._exit`, which skips the `atexit` hook
 coverage normally saves from; `patch = _exit` saves first.  (`concurrency =
 multiprocessing` is the older option for this and is not sufficient on its
 own on Windows/spawn.)
+
+Prefer `pool.close(); pool.join()` over `with Pool(...) as pool:` for
+teardown if you need coverage inside the pool to be reliable. The `with`
+form calls `Pool.terminate()` on exit, which sends `SIGTERM` to any worker
+still idle between tasks -- a real race against `sigterm = true`'s save
+handler that doesn't always land before the process dies. `close()`/`join()`
+lets workers drain normally and exit through `atexit` instead, which isn't
+racy.
+
+`multiprocessing.Pool`'s default start method is platform-dependent: `fork`
+on Linux, `spawn` on macOS/Windows. A forked worker is a copy-on-write copy
+of the parent process, so it inherits the parent's already-started
+`Coverage` instance and data file directly rather than booting a fresh
+interpreter -- `patch = fork` (via `os.register_at_fork`) resets the forked
+child onto its own data file, the same thing a fresh `spawn` interpreter
+gets for free. It's required for pool coverage on Linux and harmless
+elsewhere.
+
+**Known limitation:** `patch = fork` is not recommended for a pool nested
+inside an mpi rank (`mpi(N)` + `multiprocessing(M)`). Some MPI runtimes fork
+internally (e.g. for shared-memory setup), and `patch = fork`'s
+`os.register_at_fork` hook firing on those internal forks -- inside an
+already-threaded MPI process -- has been observed to hang. This combination
+isn't covered by the plugin's own test suite.
 
 With `coverage run -m pytest`, run `coverage combine` before reporting, as you
 already must with xdist.

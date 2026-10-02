@@ -1149,20 +1149,20 @@ def test_subprocess_child_coverage(pytester):
     result.stdout.fnmatch_lines(["*child_code.py*100%*"])
 
 
-@pytest.mark.skipif(platform.system() == "Windows",
-                    reason="multiprocessing pool children do not flush "
-                           "coverage on Windows/spawn; see the coverage "
-                           "notes in the README")
 def test_multiprocessing_pool_coverage(pytester):
-    """Pool workers need more than the ranks do: on some platforms a pool
-    child exits through ``os._exit``, which skips the atexit hook coverage
-    saves from (``patch = _exit`` covers that).  On others (macOS/spawn), a
-    worker still idle when ``with Pool(...) as pool:`` exits is instead
-    SIGTERM'd by ``Pool.terminate()`` before it ever gets a next task, which
-    bypasses atexit entirely unless ``sigterm = true`` installs coverage's
-    own handler to save first.  Relevant to the composed
-    ``mpi(N)`` + ``multiprocessing(M)`` case, where the pool lives inside a
-    rank.
+    """Pool workers need more than the ranks do: on Linux (fork) a forked
+    worker inherits the parent's already-started Coverage instance and data
+    file unless ``patch = fork`` resets it onto its own via
+    ``os.register_at_fork``.  On top of that, on some platforms a pool child
+    exits through ``os._exit``, which skips the atexit hook coverage saves
+    from (``patch = _exit`` covers that).  Workers are shut down via
+    ``pool.close(); pool.join()`` rather than ``with Pool(...) as pool:``:
+    the latter calls ``Pool.terminate()`` on exit, which SIGTERM's any
+    worker still idle between tasks -- a genuine race against coverage's
+    ``sigterm = true`` save handler that is flaky in practice (the save
+    doesn't always land before the process dies). ``close()``/``join()``
+    lets workers drain their queue and exit through the normal atexit path
+    instead, which is deterministic.
     """
     pytest.importorskip("pytest_cov")
 
@@ -1178,11 +1178,16 @@ def test_multiprocessing_pool_coverage(pytester):
 
         @pytest.mark.multiprocessing(2)
         def test_pool():
-            with multiprocessing.Pool(2) as pool:
+            pool = multiprocessing.Pool(2)
+            try:
                 assert pool.map(only_in_worker, [1, 2]) == [2, 4]
+            finally:
+                pool.close()
+                pool.join()
         """)
     pytester.path.joinpath(".coveragerc").write_text(
-        "[run]\npatch = _exit, subprocess\nsigterm = true\nsource = pool_code\n")
+        "[run]\npatch = _exit, fork, subprocess\nsigterm = true\n"
+        "source = pool_code\n")
 
     result = pytester.runpytest_subprocess(
         "--cov=pool_code", "--cov-report=term-missing")
@@ -1244,8 +1249,12 @@ def test_mpi_rank_with_pool_coverage(pytester):
         @pytest.mark.mpi(2)
         @pytest.mark.multiprocessing(2)
         def test_pool_in_rank(comm):
-            with multiprocessing.Pool(2) as pool:
+            pool = multiprocessing.Pool(2)
+            try:
                 assert pool.map(in_pool_in_rank, [1, 2]) == [3, 6]
+            finally:
+                pool.close()
+                pool.join()
         """)
     pytester.path.joinpath(".coveragerc").write_text(
         "[run]\npatch = _exit, subprocess\nsigterm = true\nsource = nested_code\n")
